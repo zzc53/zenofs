@@ -28,8 +28,8 @@ func main() {
 	defer dbManager.Close()
 	log.Printf("database connected [%s]", cfg.DatabaseUrl)
 
-	ch := make(chan db.WriteQueue, 1000)
-	poolManager := pool.New(dbManager, ch)
+	ch := make(chan []db.WriteQueue, 1000)
+	poolManager := pool.New(dbManager, ch, []pool.ChunkWriter{pool.NewLocalChunkWriter()})
 	if err := dbManager.AutoMigrate(); err != nil {
 		log.Fatalf("failed to migrate database: %+v", err)
 	}
@@ -40,28 +40,34 @@ func main() {
 	dataDisks := 3
 	parityDisks := 1
 	for i := 1; i <= dataDisks; i++ {
-		if _, err := poolManager.AddDisk(newPool.Id, fmt.Sprintf("/Users/zzc/code/disk/%d", i), int8(db.DataChunk), int8(db.LocalBackend), false); err != nil {
+		if _, err := poolManager.AddDisk(newPool.Id, fmt.Sprintf("/Users/z/code/disk/%d", i), int8(db.DataChunk), int8(db.LocalBackend), false); err != nil {
 			log.Fatal(err)
 		}
 	}
 	for j := dataDisks + 1; j <= dataDisks+parityDisks; j++ {
-		if _, err := poolManager.AddDisk(newPool.Id, fmt.Sprintf("/Users/zzc/code/disk/%d", j), int8(db.DataChunk), int8(db.LocalBackend), true); err != nil {
+		if _, err := poolManager.AddDisk(newPool.Id, fmt.Sprintf("/Users/z/code/disk/%d", j), int8(db.DataChunk), int8(db.LocalBackend), true); err != nil {
 			log.Fatal(err)
 		}
+	}
+	newPool, err = poolManager.GetPool(newPool.Id)
+	if err != nil {
+		log.Fatal(err)
 	}
 	newPool.Status = 0
 	dbManager.DB.Save(&newPool)
 
-	bytes := make([]byte, 4096)
-	_, err = rand.Read(bytes)
+	bytes := make([][]byte, 64)
+	for i := range bytes {
+		bytes[i] = make([]byte, 4096*1024)
+		_, err = rand.Read(bytes[i])
+	}
 
 	if err != nil {
 		log.Fatal(err)
 	}
-	chunk, err := poolManager.AddChunk(newPool.Id, bytes)
+	_, err = poolManager.AddChunks(newPool.Id, bytes)
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("%+v", chunk)
 
 }

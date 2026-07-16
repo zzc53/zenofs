@@ -13,13 +13,15 @@ import (
 
 type PoolManager struct {
 	DbManager  *db.DbManager
-	WriteQueue chan db.WriteQueue
+	WriteQueue chan []db.WriteQueue
+	Writers    []ChunkWriter
 }
 
-func New(dbManager *db.DbManager, writeQueue chan db.WriteQueue) *PoolManager {
+func New(dbManager *db.DbManager, writeQueue chan []db.WriteQueue, writers []ChunkWriter) *PoolManager {
 	return &PoolManager{
 		DbManager:  dbManager,
 		WriteQueue: writeQueue,
+		Writers:    writers,
 	}
 }
 
@@ -31,20 +33,12 @@ func (p *PoolManager) checkPoolName(name string) error {
 	return nil
 }
 
-func (p *PoolManager) checkPoolId(id int64) (*db.Pool, error) {
+func (p *PoolManager) GetPool(id int64) (*db.Pool, error) {
 	var existingPool db.Pool
 	if p.DbManager.DB.Where("id = ?", id).First(&existingPool).Error != nil {
 		return nil, errs.New(errs.ECODE_POOL_BAD, errs.ESTR_POOL_BAD, "invalid pool id", strconv.FormatInt(id, 10))
 	}
 	return &existingPool, nil
-}
-
-func (p *PoolManager) getPoolOnlineDataDisks(tx *gorm.DB, poolId int64) ([]db.Disk, error) {
-	var disks []db.Disk
-	if tx.Where("pool_id = ? AND status = ? AND type = ?", poolId, db.Online, db.DataDisk).Find(&disks).Error != nil {
-		return nil, errs.New(errs.ECODE_POOL_BAD, errs.ESTR_POOL_BAD, "invalid pool id", strconv.FormatInt(poolId, 10))
-	}
-	return disks, nil
 }
 
 func (p *PoolManager) AddPool(name string, chunkSizeKb int64) (*db.Pool, error) {
