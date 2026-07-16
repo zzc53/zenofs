@@ -20,6 +20,7 @@ const (
 
 	ECODE_CHUNK_EMPTY       = 13
 	ECODE_CHUNK_SIZE_EXCEED = 14
+	ECODE_CHUNK_NOT_FOUND   = 15
 )
 
 const (
@@ -40,6 +41,7 @@ const (
 
 	ESTR_CHUNK_EMPTY       = "CHUNK_ALLOC"
 	ESTR_CHUNK_SIZE_EXCEED = "CHUNK_SIZE_EXCEED"
+	ESTR_CHUNK_NOT_FOUND   = "CHUNK_NOT_FOUND"
 )
 
 type ZenoError struct {

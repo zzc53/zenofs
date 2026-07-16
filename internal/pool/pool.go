@@ -2,6 +2,7 @@ package pool
 
 import (
 	"fmt"
+	"log"
 	"strconv"
 
 	"github.com/zzc53/zenofs/internal/errs"
@@ -14,14 +15,14 @@ import (
 type PoolManager struct {
 	DbManager  *db.DbManager
 	WriteQueue chan []db.WriteQueue
-	Writers    []ChunkWriter
+	Handlers   []ChunkHandler
 }
 
-func New(dbManager *db.DbManager, writeQueue chan []db.WriteQueue, writers []ChunkWriter) *PoolManager {
+func New(dbManager *db.DbManager, writeQueue chan []db.WriteQueue, handlers []ChunkHandler) *PoolManager {
 	return &PoolManager{
 		DbManager:  dbManager,
 		WriteQueue: writeQueue,
-		Writers:    writers,
+		Handlers:   handlers,
 	}
 }
 
@@ -68,6 +69,9 @@ func (p *PoolManager) AddDisk(poolId int64, path string, diskBackend int8, diskT
 	}
 
 	var disk db.Disk
+	var chunkType db.ChunkType
+	var idx int64 // new chunk's index (= old shard count)
+
 	err := p.DbManager.DB.Transaction(func(tx *gorm.DB) error {
 		var existingPool db.Pool
 		if err1 := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).Where("id = ?", poolId).First(&existingPool).Error; err1 != nil {
@@ -90,13 +94,70 @@ func (p *PoolManager) AddDisk(poolId int64, path string, diskBackend int8, diskT
 		if addParity {
 			existingPool.ParityShards += 1
 			existingPool.Status = db.Offline
+			chunkType = db.ParityChunk
+			idx = existingPool.ParityShards - 1
 		} else {
 			existingPool.DataShards += 1
+			chunkType = db.DataChunk
+			idx = existingPool.DataShards - 1
 		}
 		if err1 := tx.Save(&existingPool).Error; err1 != nil {
 			return errs.FromError(err1, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
 		}
 		return nil
 	})
-	return &disk, err
+	if err != nil {
+		return nil, err
+	}
+
+	// 释放 pool 锁后，为已有 stripe 预分配 chunk slot（新盘对应位置）
+	// 此处失败不影响 disk 添加成功，仅记录日志
+	var stripes []db.Stripe
+	if err := p.DbManager.DB.Where("pool_id = ?", poolId).Find(&stripes).Error; err != nil {
+		log.Printf("add disk: query stripes failed: %v", err)
+		return &disk, nil
+	}
+	if len(stripes) > 0 {
+		allocs := make([]db.Chunk, len(stripes))
+		for i, s := range stripes {
+			p, err2 := generateChunkPath()
+			if err2 != nil {
+				log.Printf("add disk: generate path failed: %v", err2)
+				return &disk, nil
+			}
+			allocs[i] = db.Chunk{
+				Status:   db.ChunkReserved,
+				Path:     p,
+				DiskId:   disk.Id,
+				StripeId: s.Id,
+				Type:     chunkType,
+				Index:    idx,
+			}
+		}
+		if err := p.DbManager.DB.Create(&allocs).Error; err != nil {
+			log.Printf("add disk: pre-allocate chunks failed: %v", err)
+		}
+	}
+	return &disk, nil
+}
+
+// OfflinePool 标记 pool 为 Offline，暂停所有读写操作。
+func (p *PoolManager) OfflinePool(poolId int64) error {
+	return p.DbManager.DB.Model(&db.Pool{}).
+		Where("id = ?", poolId).Update("status", db.Offline).Error
+}
+
+// SwapDisk 替换硬盘路径：标记 disk 为 Repair，对应 chunk 标记 Error，更新路径。
+func (p *PoolManager) SwapDisk(diskId int64, newPath string) error {
+	return p.DbManager.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&db.Disk{}).Where("id = ?", diskId).
+			Updates(map[string]interface{}{
+				"status": db.Repair,
+				"path":   newPath,
+			}).Error; err != nil {
+			return err
+		}
+		return tx.Model(&db.Chunk{}).Where("disk_id = ?", diskId).
+			Update("status", db.ChunkError).Error
+	})
 }

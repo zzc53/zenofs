@@ -182,6 +182,10 @@ func (p *PoolManager) AddChunks(poolId int64, dataList [][]byte) ([]db.Chunk, er
 					if err != nil {
 						return errs.FromError(err, errs.ECODE_CRYPTO_ERROR, errs.ESTR_CRYPTO_ERROR)
 					}
+					idx := int64(i)
+					if i >= dataShards {
+						idx = int64(i - dataShards) // parity 独立编号
+					}
 					allChunks[i] = db.Chunk{
 						Status:   status,
 						Path:     p,
@@ -190,7 +194,7 @@ func (p *PoolManager) AddChunks(poolId int64, dataList [][]byte) ([]db.Chunk, er
 						Size:     size,
 						Checksum: checksum,
 						Type:     typ,
-						Index:    int64(i),
+						Index:    idx,
 					}
 				}
 				if err := tx.Create(&allChunks).Error; err != nil {
@@ -244,16 +248,15 @@ func (p *PoolManager) AddChunks(poolId int64, dataList [][]byte) ([]db.Chunk, er
 		wg.Add(1)
 		go func(idx int, disk db.Disk, relPath string, data []byte) {
 			defer wg.Done()
-			for _, w := range p.Writers {
-				if w.WriterType() == disk.Backend {
-					if err := w.Write(disk, relPath, data); err != nil {
-						resultCh <- writeResult{idx, errs.FromError(err, errs.ECODE_FILE_WRITE, errs.ESTR_FILE_WRITE)}
-					}
-					return
-				}
+			h := p.handlerFor(disk.Backend)
+			if h == nil {
+				resultCh <- writeResult{idx, errs.New(errs.ECODE_FILE_WRITE, errs.ESTR_FILE_WRITE,
+					"no handler for backend", strconv.Itoa(int(disk.Backend)))}
+				return
 			}
-			resultCh <- writeResult{idx, errs.New(errs.ECODE_FILE_WRITE, errs.ESTR_FILE_WRITE,
-				"no writer found for backend", strconv.Itoa(int(disk.Backend)))}
+			if err := h.Write(disk, relPath, data); err != nil {
+				resultCh <- writeResult{idx, errs.FromError(err, errs.ECODE_FILE_WRITE, errs.ESTR_FILE_WRITE)}
+			}
 		}(i, diskById[c.DiskId], c.Path, items[i].data)
 	}
 	wg.Wait()
@@ -315,4 +318,271 @@ func generateChunkPath() (string, error) {
 		return "", err
 	}
 	return path.Join(dateStr, suffix), nil
+}
+
+// WriteChunkItem 指定待写入的 chunk ID 和对应的数据。
+type WriteChunkItem struct {
+	ChunkId int64
+	Data    []byte
+}
+
+// WriteChunks 向已分配的 chunk（通过 ChunkId）写入数据。
+// 常用于 parity worker 回填校验块。不分配新 stripe，不查重。
+func (p *PoolManager) WriteChunks(poolId int64, items []WriteChunkItem) ([]db.Chunk, error) {
+	if len(items) == 0 {
+		return nil, errs.New(errs.ECODE_CHUNK_EMPTY, errs.ESTR_CHUNK_EMPTY, "empty items", "")
+	}
+
+	pool, err := p.GetPool(poolId)
+	if err != nil {
+		return nil, err
+	}
+	if pool.Status != db.Online {
+		return nil, errs.New(errs.ECODE_POOL_OFFLINE, errs.ESTR_POOL_OFFLINE, "pool is offline", strconv.FormatInt(poolId, 10))
+	}
+
+	N := len(items)
+
+	// 预计算 hash 和 size
+	type prepared struct {
+		chunkId int64
+		data    []byte
+		hash    [32]byte
+		size    int
+	}
+	prep := make([]prepared, N)
+	for i, it := range items {
+		if len(it.Data) == 0 {
+			return nil, errs.New(errs.ECODE_CHUNK_EMPTY, errs.ESTR_CHUNK_EMPTY, "empty data", strconv.Itoa(i))
+		}
+		prep[i] = prepared{
+			chunkId: it.ChunkId,
+			data:    it.Data,
+			hash:    blake3.Sum256(it.Data),
+			size:    len(it.Data),
+		}
+	}
+
+	maxSize := pool.ChunkSize * 1024
+	for _, it := range prep {
+		if int64(it.size) > maxSize {
+			return nil, errs.New(errs.ECODE_CHUNK_SIZE_EXCEED, errs.ESTR_CHUNK_SIZE_EXCEED,
+				"data exceeds pool chunk size", strconv.FormatInt(maxSize, 10))
+		}
+	}
+
+	// 一次查出所有 chunk，验证属于该 pool
+	chunkIds := make([]int64, N)
+	for i, it := range prep {
+		chunkIds[i] = it.chunkId
+	}
+	var chunks []db.Chunk
+	if err := p.DbManager.DB.Joins("JOIN stripes ON chunks.stripe_id = stripes.id").
+		Where("chunks.id IN ? AND stripes.pool_id = ?", chunkIds, poolId).
+		Find(&chunks).Error; err != nil {
+		return nil, errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
+	}
+	if len(chunks) != N {
+		return nil, errs.New(errs.ECODE_CHUNK_NOT_FOUND, errs.ESTR_CHUNK_NOT_FOUND,
+			"some chunks not found or not in pool", strconv.FormatInt(poolId, 10))
+	}
+
+	// 按 chunk ID 建索引保持顺序
+	chunkById := make(map[int64]*db.Chunk, N)
+	for i := range chunks {
+		chunkById[chunks[i].Id] = &chunks[i]
+	}
+	ordered := make([]db.Chunk, N)
+	for i, it := range prep {
+		ordered[i] = *chunkById[it.chunkId]
+	}
+
+	// 预加载盘信息（写文件用）
+	var allDisks []db.Disk
+	if err := p.DbManager.DB.Where("pool_id = ?", poolId).Find(&allDisks).Error; err != nil {
+		return nil, errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
+	}
+	diskById := make(map[int64]db.Disk, len(allDisks))
+	for i := range allDisks {
+		diskById[allDisks[i].Id] = allDisks[i]
+	}
+
+	// 事务内更新 chunk 元数据
+	err = p.DbManager.DB.Transaction(func(tx *gorm.DB) error {
+		for i := range ordered {
+			ordered[i].Status = db.ChunkPending
+			ordered[i].Size = int64(prep[i].size)
+			ordered[i].Checksum = prep[i].hash[:]
+			if ordered[i].Path == "" {
+				p, err := generateChunkPath()
+				if err != nil {
+					return errs.FromError(err, errs.ECODE_CRYPTO_ERROR, errs.ESTR_CRYPTO_ERROR)
+				}
+				ordered[i].Path = p
+			}
+		}
+		return tx.Save(&ordered).Error
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// 事务外并行写文件
+	type writeResult struct {
+		idx int
+		err error
+	}
+	resultCh := make(chan writeResult, N)
+	var wg sync.WaitGroup
+	for i := range ordered {
+		wg.Add(1)
+		go func(idx int, disk db.Disk, relPath string, data []byte) {
+			defer wg.Done()
+			h := p.handlerFor(disk.Backend)
+			if h == nil {
+				resultCh <- writeResult{idx, errs.New(errs.ECODE_FILE_WRITE, errs.ESTR_FILE_WRITE,
+					"no handler for backend", strconv.Itoa(int(disk.Backend)))}
+				return
+			}
+			if err := h.Write(disk, relPath, data); err != nil {
+				resultCh <- writeResult{idx, errs.FromError(err, errs.ECODE_FILE_WRITE, errs.ESTR_FILE_WRITE)}
+			}
+		}(i, diskById[ordered[i].DiskId], ordered[i].Path, prep[i].data)
+	}
+	wg.Wait()
+	close(resultCh)
+
+	var firstErr error
+	var failedIdx []int
+	for r := range resultCh {
+		if r.err != nil {
+			failedIdx = append(failedIdx, r.idx)
+			if firstErr == nil {
+				firstErr = r.err
+			}
+		}
+	}
+	if firstErr != nil {
+		var errorIds, successIds []int64
+		failed := make(map[int]bool, len(failedIdx))
+		for _, idx := range failedIdx {
+			failed[idx] = true
+		}
+		for i := range ordered {
+			if failed[i] {
+				errorIds = append(errorIds, ordered[i].Id)
+			} else {
+				successIds = append(successIds, ordered[i].Id)
+			}
+		}
+		if len(errorIds) > 0 {
+			p.DbManager.DB.Model(&db.Chunk{}).Where("id IN ?", errorIds).Update("status", db.ChunkError)
+		}
+		if len(successIds) > 0 {
+			p.DbManager.DB.Model(&db.Chunk{}).Where("id IN ?", successIds).Update("status", db.ChunkUpdated)
+		}
+		return nil, firstErr
+	}
+
+	writeEntries := make([]db.WriteQueue, N)
+	for i := range ordered {
+		writeEntries[i] = db.WriteQueue{
+			ChunkId:  ordered[i].Id,
+			StripeId: ordered[i].StripeId,
+		}
+	}
+	if err := p.DbManager.DB.Create(&writeEntries).Error; err != nil {
+		return nil, errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
+	}
+	p.WriteQueue <- writeEntries
+
+	return ordered, nil
+}
+
+// ReadChunks 批量读取 chunk 数据，返回顺序与 chunkIds 一致。
+func (p *PoolManager) ReadChunks(poolId int64, chunkIds []int64) ([][]byte, error) {
+	if len(chunkIds) == 0 {
+		return nil, errs.New(errs.ECODE_CHUNK_EMPTY, errs.ESTR_CHUNK_EMPTY, "empty chunk ids", "")
+	}
+
+	// 校验 pool
+	pool, err := p.GetPool(poolId)
+	if err != nil {
+		return nil, err
+	}
+	if pool.Status != db.Online {
+		return nil, errs.New(errs.ECODE_POOL_OFFLINE, errs.ESTR_POOL_OFFLINE, "pool is offline", strconv.FormatInt(poolId, 10))
+	}
+
+	N := len(chunkIds)
+
+	// 一次查出所有 chunk，验证属于该 pool
+	var chunks []db.Chunk
+	if err := p.DbManager.DB.Joins("JOIN stripes ON chunks.stripe_id = stripes.id").
+		Where("chunks.id IN ? AND stripes.pool_id = ?", chunkIds, poolId).
+		Find(&chunks).Error; err != nil {
+		return nil, errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
+	}
+	if len(chunks) != N {
+		return nil, errs.New(errs.ECODE_CHUNK_NOT_FOUND, errs.ESTR_CHUNK_NOT_FOUND,
+			"some chunks not found or not in pool", strconv.FormatInt(poolId, 10))
+	}
+
+	// 按 chunk ID 建索引保持顺序
+	chunkById := make(map[int64]db.Chunk, N)
+	for _, c := range chunks {
+		chunkById[c.Id] = c
+	}
+	ordered := make([]db.Chunk, N)
+	for i, id := range chunkIds {
+		ordered[i] = chunkById[id]
+	}
+
+	// 预加载盘信息
+	var allDisks []db.Disk
+	if err := p.DbManager.DB.Where("pool_id = ?", poolId).Find(&allDisks).Error; err != nil {
+		return nil, errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
+	}
+	diskById := make(map[int64]db.Disk, len(allDisks))
+	for i := range allDisks {
+		diskById[allDisks[i].Id] = allDisks[i]
+	}
+
+	// 并行读取
+	type readResult struct {
+		idx  int
+		data []byte
+		err  error
+	}
+	resultCh := make(chan readResult, N)
+	var wg sync.WaitGroup
+	for i, c := range ordered {
+		wg.Add(1)
+		go func(idx int, disk db.Disk, relPath string) {
+			defer wg.Done()
+			h := p.handlerFor(disk.Backend)
+			if h == nil {
+				resultCh <- readResult{idx, nil, errs.New(errs.ECODE_FILE_WRITE, errs.ESTR_FILE_WRITE,
+					"no handler for backend", strconv.Itoa(int(disk.Backend)))}
+				return
+			}
+			data, err := h.Read(disk, relPath)
+			if err != nil {
+				resultCh <- readResult{idx, nil, errs.FromError(err, errs.ECODE_FILE_WRITE, errs.ESTR_FILE_WRITE)}
+			} else {
+				resultCh <- readResult{idx, data, nil}
+			}
+		}(i, diskById[c.DiskId], c.Path)
+	}
+	wg.Wait()
+	close(resultCh)
+
+	results := make([][]byte, N)
+	for r := range resultCh {
+		if r.err != nil {
+			return nil, r.err
+		}
+		results[r.idx] = r.data
+	}
+	return results, nil
 }

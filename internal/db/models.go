@@ -82,12 +82,21 @@ const (
 	ChunkDelete
 )
 
+type WriteQueueStatus int8
+
+const (
+	QueuePending WriteQueueStatus = iota
+	QueueProcessing
+	QueueDone
+)
+
 type WriteQueue struct {
-	Id        int64   `gorm:"primaryKey"`
-	ChunkId   int64   `gorm:"index"`
-	StripeId  int64   `gorm:"index"`
-	Op        ChunkOp `gorm:"index"`
-	CreatedAt int64   `gorm:"autoCreateTime;index"`
+	Id        int64            `gorm:"primaryKey"`
+	ChunkId   int64            `gorm:"index"`
+	StripeId  int64            `gorm:"index"`
+	Op        ChunkOp          `gorm:"index"`
+	Status    WriteQueueStatus `gorm:"index;default:0"`
+	CreatedAt int64            `gorm:"autoCreateTime;index"`
 }
 
 type ReadCache struct {
