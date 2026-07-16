@@ -40,6 +40,9 @@ func (p *PoolManager) GetPool(id int64) (*db.Pool, error) {
 }
 
 func (p *PoolManager) AddPool(name string, chunkSizeKb int64) (*db.Pool, error) {
+	if chunkSizeKb <= 0 || chunkSizeKb > 64*1024 {
+		return nil, errs.New(errs.ECODE_POOL_BAD, errs.ESTR_POOL_BAD, "chunk size must be 1-65536 KB (max 64MB)", strconv.FormatInt(chunkSizeKb, 10))
+	}
 	if err := p.acquireLock("add_pool", "add pool", 0, 0); err != nil {
 		return nil, err
 	}

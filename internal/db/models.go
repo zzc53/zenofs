@@ -50,7 +50,7 @@ type ChunkStatus int8
 const (
 	ChunkReserved ChunkStatus = iota // 0 — 预分配 slot
 	ChunkPending                     // 1 — 数据已写入
-	ChunkUpdated                     // 2 — 数据已更新
+	ChunkDirty                      // 2 — 数据已写入，parity 待计算
 	ChunkActive                      // 3 — 数据已写入
 	ChunkError                       // 4 - 数据损坏
 )

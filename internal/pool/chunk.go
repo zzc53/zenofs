@@ -50,6 +50,8 @@ func (p *PoolManager) AddChunk(poolId int64, bytes []byte) (*db.Chunk, error) {
 	return &chunks[0], nil
 }
 
+const maxChunkBytes = 64 * 1024 * 1024 // 64MB safety guard
+
 // AddChunks 批量写入 chunks，支持任意数量（1 ≤ N）。
 //
 // 分配策略：
@@ -95,7 +97,7 @@ func (p *PoolManager) AddChunks(poolId int64, dataList [][]byte) ([]db.Chunk, er
 		}
 	}
 
-	// 校验每个 chunk 大小不超过 pool 设定（ChunkSize 单位为 KB）
+	// 校验每个 chunk 大小不超过 pool 的 chunk size
 	maxSize := pool.ChunkSize * 1024
 	for _, it := range items {
 		if int64(it.size) > maxSize {
@@ -297,7 +299,7 @@ func (p *PoolManager) AddChunks(poolId int64, dataList [][]byte) ([]db.Chunk, er
 			p.DbManager.DB.Model(&db.Chunk{}).Where("id IN ?", errorIds).Update("status", db.ChunkError)
 		}
 		if len(successIds) > 0 {
-			p.DbManager.DB.Model(&db.Chunk{}).Where("id IN ?", successIds).Update("status", db.ChunkUpdated)
+			p.DbManager.DB.Model(&db.Chunk{}).Where("id IN ?", successIds).Update("status", db.ChunkDirty)
 			var wq []db.WriteQueue
 			for i, c := range chunks {
 				if !failed[i] {
@@ -314,7 +316,7 @@ func (p *PoolManager) AddChunks(poolId int64, dataList [][]byte) ([]db.Chunk, er
 	for i, c := range chunks {
 		ids[i] = c.Id
 	}
-	p.DbManager.DB.Model(&db.Chunk{}).Where("id IN ?", ids).Update("status", db.ChunkUpdated)
+	p.DbManager.DB.Model(&db.Chunk{}).Where("id IN ?", ids).Update("status", db.ChunkDirty)
 
 	// 批量写 WriteQueue（即 parity 队列）
 	writeEntries := make([]db.WriteQueue, len(chunks))
@@ -507,7 +509,7 @@ func (p *PoolManager) WriteChunks(items []WriteChunkItem) ([]db.Chunk, error) {
 			p.DbManager.DB.Model(&db.Chunk{}).Where("id IN ?", errorIds).Update("status", db.ChunkError)
 		}
 		if len(successIds) > 0 {
-			p.DbManager.DB.Model(&db.Chunk{}).Where("id IN ?", successIds).Update("status", db.ChunkUpdated)
+			p.DbManager.DB.Model(&db.Chunk{}).Where("id IN ?", successIds).Update("status", db.ChunkDirty)
 			var wq []db.WriteQueue
 			for i, c := range ordered {
 				if !failed[i] {
@@ -524,7 +526,7 @@ func (p *PoolManager) WriteChunks(items []WriteChunkItem) ([]db.Chunk, error) {
 	for i := range ordered {
 		allIds[i] = ordered[i].Id
 	}
-	p.DbManager.DB.Model(&db.Chunk{}).Where("id IN ?", allIds).Update("status", db.ChunkUpdated)
+	p.DbManager.DB.Model(&db.Chunk{}).Where("id IN ?", allIds).Update("status", db.ChunkDirty)
 
 	writeEntries := make([]db.WriteQueue, N)
 	for i := range ordered {
@@ -626,4 +628,113 @@ func (p *PoolManager) ReadChunks(poolId int64, chunkIds []int64) ([][]byte, erro
 		results[r.idx] = r.data
 	}
 	return results, nil
+}
+
+// ReadChunkPartial 从 chunk 的指定偏移读取指定长度的数据。
+func (p *PoolManager) ReadChunkPartial(chunkId int64, offset int64, length int64) ([]byte, error) {
+	var chunk db.Chunk
+	if err := p.DbManager.DB.First(&chunk, chunkId).Error; err != nil {
+		return nil, errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
+	}
+
+	// 推导 poolId 并校验 pool 在线
+	var stripe db.Stripe
+	if err := p.DbManager.DB.First(&stripe, chunk.StripeId).Error; err != nil {
+		return nil, errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
+	}
+	pool, err := p.GetPool(stripe.PoolId)
+	if err != nil {
+		return nil, err
+	}
+	if pool.Status != db.Online {
+		return nil, errs.New(errs.ECODE_POOL_OFFLINE, errs.ESTR_POOL_OFFLINE, "pool is offline", strconv.FormatInt(stripe.PoolId, 10))
+	}
+
+	var disk db.Disk
+	if err := p.DbManager.DB.First(&disk, chunk.DiskId).Error; err != nil {
+		return nil, errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
+	}
+
+	h := p.handlerFor(disk.Backend)
+	if h == nil {
+		return nil, errs.New(errs.ECODE_FILE_WRITE, errs.ESTR_FILE_WRITE, "no handler for backend", strconv.Itoa(int(disk.Backend)))
+	}
+
+	data, err := h.ReadAt(disk, chunk.Path, offset, length)
+	if err != nil {
+		return nil, errs.FromError(err, errs.ECODE_FILE_WRITE, errs.ESTR_FILE_WRITE)
+	}
+	return data, nil
+}
+
+// WriteChunkPartial 从指定偏移写入数据到 chunk。
+// 写入后标记 chunk 为 Dirty，由 parity worker 异步更新 parity。
+func (p *PoolManager) WriteChunkPartial(chunkId int64, offset int64, data []byte) error {
+	if len(data) == 0 {
+		return errs.New(errs.ECODE_CHUNK_EMPTY, errs.ESTR_CHUNK_EMPTY, "empty data", "")
+	}
+	if int64(len(data)) > maxChunkBytes {
+		return errs.New(errs.ECODE_CHUNK_SIZE_EXCEED, errs.ESTR_CHUNK_SIZE_EXCEED,
+			"write exceeds max chunk size", strconv.FormatInt(maxChunkBytes, 10))
+	}
+
+	var chunk db.Chunk
+	if err := p.DbManager.DB.First(&chunk, chunkId).Error; err != nil {
+		return errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
+	}
+
+	// 推导 poolId 并校验 pool 在线
+	var stripe db.Stripe
+	if err := p.DbManager.DB.First(&stripe, chunk.StripeId).Error; err != nil {
+		return errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
+	}
+	pool, err := p.GetPool(stripe.PoolId)
+	if err != nil {
+		return err
+	}
+	if pool.Status != db.Online {
+		return errs.New(errs.ECODE_POOL_OFFLINE, errs.ESTR_POOL_OFFLINE, "pool is offline", strconv.FormatInt(stripe.PoolId, 10))
+	}
+
+	var disk db.Disk
+	if err := p.DbManager.DB.First(&disk, chunk.DiskId).Error; err != nil {
+		return errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
+	}
+
+	h := p.handlerFor(disk.Backend)
+	if h == nil {
+		return errs.New(errs.ECODE_FILE_WRITE, errs.ESTR_FILE_WRITE, "no handler for backend", strconv.Itoa(int(disk.Backend)))
+	}
+
+	if err := h.WriteAt(disk, chunk.Path, offset, data); err != nil {
+		return errs.FromError(err, errs.ECODE_FILE_WRITE, errs.ESTR_FILE_WRITE)
+	}
+
+	// 重新读取完整数据计算 checksum
+	fullData, err := h.Read(disk, chunk.Path)
+	if err != nil {
+		return errs.FromError(err, errs.ECODE_FILE_WRITE, errs.ESTR_FILE_WRITE)
+	}
+	newSize := int64(len(fullData))
+	hash := blake3.Sum256(fullData)
+
+	// 更新元数据：size、checksum、状态、WriteQueue
+	if err := p.DbManager.DB.Model(&db.Chunk{}).Where("id = ?", chunkId).Updates(map[string]interface{}{
+		"status":   db.ChunkDirty,
+		"size":     newSize,
+		"checksum": hash[:],
+	}).Error; err != nil {
+		return errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
+	}
+
+	// 入队 WriteQueue
+	wq := db.WriteQueue{
+		ChunkId:  chunkId,
+		StripeId: chunk.StripeId,
+	}
+	if err := p.DbManager.DB.Create(&wq).Error; err != nil {
+		return errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
+	}
+
+	return nil
 }

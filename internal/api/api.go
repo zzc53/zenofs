@@ -161,11 +161,43 @@ func NewRouter(pm *pool.PoolManager) *chi.Mux {
 			respondJSON(w, http.StatusOK, chunks[0])
 		})
 
+		// ── Chunk Partial Read/Write ──
+		r.Get("/chunks/{id}/range", func(w http.ResponseWriter, r *http.Request) {
+			id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+			offset, _ := strconv.ParseInt(r.URL.Query().Get("offset"), 10, 64)
+			length, _ := strconv.ParseInt(r.URL.Query().Get("length"), 10, 64)
+			if length <= 0 {
+				respondJSON(w, http.StatusBadRequest, apiError{Message: "invalid length"})
+				return
+			}
+			data, err := pm.ReadChunkPartial(id, offset, length)
+			if err != nil {
+				respondErr(w, err)
+				return
+			}
+			w.Write(data)
+		})
+
+		r.Put("/chunks/{id}/range", func(w http.ResponseWriter, r *http.Request) {
+			id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+			offset, _ := strconv.ParseInt(r.URL.Query().Get("offset"), 10, 64)
+			data, err := io.ReadAll(r.Body)
+			if err != nil {
+				respondJSON(w, http.StatusBadRequest, apiError{Message: "read body failed"})
+				return
+			}
+			if err := pm.WriteChunkPartial(id, offset, data); err != nil {
+				respondErr(w, err)
+				return
+			}
+			respondJSON(w, http.StatusOK, map[string]string{"status": "written"})
+		})
+
 		// ── Repair ──
 		r.Post("/pools/{poolId}/reconstruct", func(w http.ResponseWriter, r *http.Request) {
 			poolId, _ := strconv.ParseInt(chi.URLParam(r, "poolId"), 10, 64)
 			go pm.ReconstructStripes(poolId)
-			respondJSON(w, http.StatusOK, map[string]string{"status": "reconstruct started"})
+			respondJSON(w, http.StatusOK, map[string]string{"status": "task started"})
 		})
 	})
 
