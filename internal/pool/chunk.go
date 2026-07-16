@@ -591,31 +591,40 @@ func (p *PoolManager) ReadChunks(poolId int64, chunkIds []int64) ([][]byte, erro
 		diskById[allDisks[i].Id] = allDisks[i]
 	}
 
-	// 并行读取
+	// 并行读取（优先走缓存）
 	type readResult struct {
-		idx  int
-		data []byte
-		err  error
+		idx      int
+		data     []byte
+		err      error
+		fromCache bool
 	}
 	resultCh := make(chan readResult, N)
 	var wg sync.WaitGroup
 	for i, c := range ordered {
 		wg.Add(1)
-		go func(idx int, disk db.Disk, relPath string) {
+		go func(idx int, chk db.Chunk) {
 			defer wg.Done()
+			// 尝试从缓存读取
+			if data, _ := p.tryReadCache(chk.Id); data != nil {
+				resultCh <- readResult{idx: idx, data: data, err: nil, fromCache: true}
+				return
+			}
+			disk := diskById[chk.DiskId]
 			h := p.handlerFor(disk.Backend)
 			if h == nil {
 				resultCh <- readResult{idx, nil, errs.New(errs.ECODE_FILE_WRITE, errs.ESTR_FILE_WRITE,
-					"no handler for backend", strconv.Itoa(int(disk.Backend)))}
+					"no handler for backend", strconv.Itoa(int(disk.Backend))), false}
 				return
 			}
-			data, err := h.Read(disk, relPath)
+			data, err := h.Read(disk, chk.Path)
 			if err != nil {
-				resultCh <- readResult{idx, nil, errs.FromError(err, errs.ECODE_FILE_WRITE, errs.ESTR_FILE_WRITE)}
+				resultCh <- readResult{idx, nil, errs.FromError(err, errs.ECODE_FILE_WRITE, errs.ESTR_FILE_WRITE), false}
 			} else {
-				resultCh <- readResult{idx, data, nil}
+				// 异步缓存
+				go p.writeCache(poolId, chk.Id, data)
+				resultCh <- readResult{idx, data, nil, false}
 			}
-		}(i, diskById[c.DiskId], c.Path)
+		}(i, c)
 	}
 	wg.Wait()
 	close(resultCh)
@@ -632,6 +641,18 @@ func (p *PoolManager) ReadChunks(poolId int64, chunkIds []int64) ([][]byte, erro
 
 // ReadChunkPartial 从 chunk 的指定偏移读取指定长度的数据。
 func (p *PoolManager) ReadChunkPartial(chunkId int64, offset int64, length int64) ([]byte, error) {
+	// 尝试从全量缓存读取
+	if cached, _ := p.tryReadCache(chunkId); cached != nil {
+		end := offset + length
+		if end > int64(len(cached)) {
+			end = int64(len(cached))
+		}
+		if offset >= end {
+			return nil, errs.New(errs.ECODE_CHUNK_EMPTY, errs.ESTR_CHUNK_EMPTY, "offset beyond data", strconv.FormatInt(offset, 10))
+		}
+		return cached[offset:end], nil
+	}
+
 	var chunk db.Chunk
 	if err := p.DbManager.DB.First(&chunk, chunkId).Error; err != nil {
 		return nil, errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
@@ -642,11 +663,11 @@ func (p *PoolManager) ReadChunkPartial(chunkId int64, offset int64, length int64
 	if err := p.DbManager.DB.First(&stripe, chunk.StripeId).Error; err != nil {
 		return nil, errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
 	}
-	pool, err := p.GetPool(stripe.PoolId)
+	poolObj, err := p.GetPool(stripe.PoolId)
 	if err != nil {
 		return nil, err
 	}
-	if pool.Status != db.Online {
+	if poolObj.Status != db.Online {
 		return nil, errs.New(errs.ECODE_POOL_OFFLINE, errs.ESTR_POOL_OFFLINE, "pool is offline", strconv.FormatInt(stripe.PoolId, 10))
 	}
 
@@ -664,6 +685,15 @@ func (p *PoolManager) ReadChunkPartial(chunkId int64, offset int64, length int64
 	if err != nil {
 		return nil, errs.FromError(err, errs.ECODE_FILE_WRITE, errs.ESTR_FILE_WRITE)
 	}
+
+	// 异步缓存全量数据
+	go func() {
+		full, err := h.Read(disk, chunk.Path)
+		if err == nil {
+			p.writeCache(stripe.PoolId, chunkId, full)
+		}
+	}()
+
 	return data, nil
 }
 

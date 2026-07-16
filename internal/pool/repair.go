@@ -14,11 +14,11 @@ import (
 // ReconstructStripes 重建 pool 中所有含 ChunkError 的 stripe。
 // 批量 DB 读 → 并行文件计算 → 批量 DB 写。
 func (p *PoolManager) ReconstructStripes(poolId int64) {
-	if err := p.acquireLock("reconstruct_stripes", "reconstruct stripes", poolId, 0); err != nil {
+	if err := p.acquireLock("reconstruct_stripes", "reconstruct stripes", poolId, 0, ""); err != nil {
 		log.Printf("reconstruct: %v", err)
 		return
 	}
-	defer p.releaseLock("reconstruct_stripes")
+	defer p.releaseLock("reconstruct_stripes", "")
 
 	// 查出 pool 配置（确定 RS 参数）
 	var pool db.Pool

@@ -42,6 +42,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	pm.StartParityWorker(ctx)
+	pm.StartCacheCleaner(ctx)
 
 	r := api.NewRouter(pm)
 

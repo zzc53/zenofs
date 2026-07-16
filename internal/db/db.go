@@ -56,6 +56,8 @@ func (m *DbManager) AutoMigrate() error {
 		&User{}, &Share{}, &ShareUser{}, &Inode{}, &Version{}, &VersionChunk{}, &InodeHistory{}); err != nil {
 		return err
 	}
+	// inodes: 未删除的记录同一目录下不允许重名
+	m.DB.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_inode_active_parent_name ON inodes(parent_id, name) WHERE deleted = 0")
 	// 首次运行时写入默认配置
 	var count int64
 	m.DB.Model(&Setting{}).Count(&count)

@@ -5,6 +5,7 @@ import (
 	"strconv"
 
 	"github.com/zzc53/zenofs/internal/errs"
+	"gorm.io/datatypes"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
@@ -43,10 +44,10 @@ func (p *PoolManager) AddPool(name string, chunkSizeKb int64) (*db.Pool, error) 
 	if chunkSizeKb <= 0 || chunkSizeKb > 64*1024 {
 		return nil, errs.New(errs.ECODE_POOL_BAD, errs.ESTR_POOL_BAD, "chunk size must be 1-65536 KB (max 64MB)", strconv.FormatInt(chunkSizeKb, 10))
 	}
-	if err := p.acquireLock("add_pool", "add pool", 0, 0); err != nil {
+	if err := p.acquireLock("add_pool", "add pool", 0, 0, ""); err != nil {
 		return nil, err
 	}
-	defer p.releaseLock("add_pool")
+	defer p.releaseLock("add_pool", "")
 
 	if err := p.checkPoolName(name); err != nil {
 		return nil, err
@@ -65,20 +66,36 @@ func (p *PoolManager) AddPool(name string, chunkSizeKb int64) (*db.Pool, error) 
 }
 
 func (p *PoolManager) AddDisk(poolId int64, path string, diskBackend int8, diskType int8, addParity bool) (*db.Disk, error) {
-	if err := p.acquireLock("add_disk", "add disk", poolId, 0); err != nil {
+	if err := p.acquireLock("add_disk", "add disk", poolId, 0, ""); err != nil {
 		return nil, err
 	}
-	defer p.releaseLock("add_disk")
+	defer p.releaseLock("add_disk", "")
 
 	if diskBackend != int8(db.LocalBackend) {
 		return nil, errs.New(errs.ECODE_DISK_BAD_BACKEND, errs.ESTR_DISK_BAD_BACKEND, "invalid disk backend", fmt.Sprintf("%d", diskBackend))
 	}
 
-	if diskType != int8(db.DataDisk) {
+	if diskType != int8(db.DataDisk) && diskType != int8(db.CacheDisk) {
 		return nil, errs.New(errs.ECODE_DISK_BAD_TYPE, errs.ESTR_DISK_BAD_TYPE, "invalid disk type", fmt.Sprintf("%d", diskType))
 	}
 
 	var disk db.Disk
+
+	// Cache 盘不需要 stripe 预分配，直接创建并返回
+	if diskType == int8(db.CacheDisk) {
+		disk = db.Disk{
+			PoolId:  poolId,
+			Path:    path,
+			Backend: db.DiskBackend(diskBackend),
+			Type:    db.DiskType(diskType),
+			Status:  db.DiskPoolStatus(db.Online),
+		}
+		if err := p.DbManager.DB.Create(&disk).Error; err != nil {
+			return nil, errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
+		}
+		return &disk, nil
+	}
+
 	var chunkType db.ChunkType
 	var idx int64 // new chunk's index (= old shard count)
 
@@ -149,7 +166,8 @@ func (p *PoolManager) AddDisk(poolId int64, path string, diskBackend int8, diskT
 }
 
 // acquireLock 创建新任务记录，全局只有一个任务能处于 Pending/Running。
-func (p *PoolManager) acquireLock(name, desc string, poolId, diskId int64) error {
+// metadata 是可选 JSON 字符串，用于记录操作上下文。
+func (p *PoolManager) acquireLock(name, desc string, poolId, diskId int64, metadata string) error {
 	return p.DbManager.DB.Transaction(func(tx *gorm.DB) error {
 		// 锁住 ACTION_LOCK 行，跨数据库通用（行锁 / 表锁）
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
@@ -170,23 +188,33 @@ func (p *PoolManager) acquireLock(name, desc string, poolId, diskId int64) error
 			}
 			return errs.New(errs.ECODE_POOL_BAD, errs.ESTR_POOL_BAD, "another operation is running: "+msg, "")
 		}
-		return tx.Create(&db.Task{Name: name, Status: db.TaskRunning, Message: desc, PoolId: poolId, DiskId: diskId}).Error
+		return tx.Create(&db.Task{
+			Name:     name,
+			Status:   db.TaskRunning,
+			Message:  desc,
+			Metadata: datatypes.JSON([]byte(metadata)),
+		}).Error
 	})
 }
 
 // releaseLock 将当前 Running 任务标记为 Finished。
-func (p *PoolManager) releaseLock(name string) {
+// metadata 不为空时同时更新任务元数据。
+func (p *PoolManager) releaseLock(name string, metadata string) {
+	updates := map[string]interface{}{"status": db.TaskFinished}
+	if metadata != "" {
+		updates["metadata"] = datatypes.JSON([]byte(metadata))
+	}
 	p.DbManager.DB.Model(&db.Task{}).
 		Where("name = ? AND status = ?", name, db.TaskRunning).
-		Update("status", db.TaskFinished)
+		Updates(updates)
 }
 
 // OfflinePool 标记 pool 为 Offline，暂停所有读写操作。
 func (p *PoolManager) OfflinePool(poolId int64) error {
-	if err := p.acquireLock("offline_pool", "offline pool", poolId, 0); err != nil {
+	if err := p.acquireLock("offline_pool", "offline pool", poolId, 0, ""); err != nil {
 		return err
 	}
-	defer p.releaseLock("offline_pool")
+	defer p.releaseLock("offline_pool", "")
 
 	return p.DbManager.DB.Model(&db.Pool{}).
 		Where("id = ?", poolId).Update("status", db.Offline).Error
@@ -194,10 +222,10 @@ func (p *PoolManager) OfflinePool(poolId int64) error {
 
 // SwapDisk 替换硬盘路径：标记 disk 为 Repair，对应 chunk 标记 Error，更新路径。
 func (p *PoolManager) SwapDisk(diskId int64, newPath string) error {
-	if err := p.acquireLock("swap_disk", "swap disk", 0, diskId); err != nil {
+	if err := p.acquireLock("swap_disk", "swap disk", 0, diskId, ""); err != nil {
 		return err
 	}
-	defer p.releaseLock("swap_disk")
+	defer p.releaseLock("swap_disk", "")
 
 	return p.DbManager.DB.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Model(&db.Disk{}).Where("id = ?", diskId).

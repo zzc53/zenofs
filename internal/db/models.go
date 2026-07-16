@@ -1,5 +1,11 @@
 package db
 
+import (
+	"database/sql"
+
+	"gorm.io/datatypes"
+)
+
 type DiskPoolStatus int8
 
 const (
@@ -68,7 +74,7 @@ type Chunk struct {
 	Path      string
 	Size      int64
 	Checksum  []byte
-	DiskId    int64
+	DiskId    int64 `gorm:"index"`
 	StripeId  int64 `gorm:"index"`
 	Type      ChunkType
 	Index     int64
@@ -100,8 +106,9 @@ type WriteQueue struct {
 
 type ReadCache struct {
 	Id        int64 `gorm:"primaryKey"`
-	ChunkId   int64 `gorm:"index"`
+	ChunkId   int64 `gorm:"uniqueIndex"`
 	Path      string
+	DiskId    int64 `gorm:"index"`
 	CreatedAt int64 `gorm:"autoCreateTime;index"`
 	UpdatedAt int64 `gorm:"autoUpdateTime;index"`
 	ExpiredAt int64 `gorm:"index"`
@@ -129,10 +136,9 @@ type Task struct {
 	Name      string     `gorm:"index"`
 	Status    TaskStatus `gorm:"index"`
 	Message   string
-	PoolId    int64
-	DiskId    int64
-	CreatedAt int64 `gorm:"autoCreateTime;index"`
-	UpdatedAt int64 `gorm:"autoUpdateTime"`
+	Metadata  datatypes.JSON `gorm:"type:json"`
+	CreatedAt int64          `gorm:"autoCreateTime;index"`
+	UpdatedAt int64          `gorm:"autoUpdateTime"`
 }
 
 // ── Share Layer (User/Share/Inode/Version) ──
@@ -178,14 +184,14 @@ type User struct {
 }
 
 type Share struct {
-	Id               int64   `gorm:"primaryKey"`
-	Name             string  `gorm:"uniqueIndex;not null"`
-	PoolId           int64   `gorm:"index;not null"`
-	Compression      int8    `gorm:"default:0"`
-	Encryption       int8    `gorm:"default:0"`
-	EncryptionKeyHash []byte  `gorm:"default:null"`
-	CreatedBy        int64   `gorm:"index"`
-	CreatedAt        int64   `gorm:"autoCreateTime"`
+	Id                int64  `gorm:"primaryKey"`
+	Name              string `gorm:"uniqueIndex;not null"`
+	PoolId            int64  `gorm:"index;not null"`
+	Compression       int8   `gorm:"default:0"`
+	Encryption        int8   `gorm:"default:0"`
+	EncryptionKeyHash []byte `gorm:"default:null"`
+	CreatedBy         int64  `gorm:"index"`
+	CreatedAt         int64  `gorm:"autoCreateTime"`
 }
 
 // ShareUser 每个用户在每个 share 中的权限。
@@ -199,28 +205,26 @@ type ShareUser struct {
 // parent_id = NULL 时为 share 根目录。
 // kind=link 时 LinkId 指向目标 inode。
 type Inode struct {
-	Id        int64     `gorm:"primaryKey;autoIncrement"`
-	ParentId  *int64    `gorm:"index:idx_inode_parent_name,priority:1"`
-	Name      string    `gorm:"index:idx_inode_parent_name,priority:2"`
-	Kind      InodeKind `gorm:"default:0"`
-	Uid       int64     `gorm:"default:0"`
-	Gid       int64     `gorm:"default:0"`
-	Mtime     int64     `gorm:"autoUpdateTime"`
-	Ctime     int64     `gorm:"autoCreateTime"`
-	ShareId   int64     `gorm:"index"`
-	VersionId *int64    `gorm:"index"`  // 当前文件版本（目录/链接为 NULL）
-	LinkId    *int64    `gorm:"index"`  // 链接目标 inode（仅 kind=link）
-	Deleted   int8      `gorm:"default:0;index"`
+	Id        int64         `gorm:"primaryKey;autoIncrement"`
+	ParentId  sql.NullInt64 `gorm:"index:idx_inode_parent_name,priority:1"`
+	Name      string        `gorm:"index:idx_inode_parent_name,priority:2"`
+	Kind      InodeKind     `gorm:"default:0"`
+	ShareId   int64         `gorm:"index"`
+	VersionId sql.NullInt64 `gorm:"index"` // 当前文件版本（目录/链接为 NULL）
+	LinkId    sql.NullInt64 `gorm:"index"` // 链接目标 inode（仅 kind=link）
+	CreatedAt int64         `gorm:"autoCreateTime"`
+	UpdatedAt int64         `gorm:"autoUpdateTime"`
+	Deleted   int8          `gorm:"default:0;index"`
 }
 
 // Version 文件的一个版本。
 type Version struct {
-	Id         int64  `gorm:"primaryKey;autoIncrement"`
-	InodeId    int64  `gorm:"uniqueIndex:idx_ver_inode_num,priority:1;not null"`
-	VersionNum int64  `gorm:"uniqueIndex:idx_ver_inode_num,priority:2;not null"`
-	Size       int64  `gorm:"default:0"`
-	Checksum   string `gorm:"default:''"`
-	CreatedAt  int64  `gorm:"autoCreateTime"`
+	Id         int64 `gorm:"primaryKey;autoIncrement"`
+	InodeId    int64 `gorm:"uniqueIndex:idx_ver_inode_num,priority:1;not null"`
+	VersionNum int64 `gorm:"uniqueIndex:idx_ver_inode_num,priority:2;not null"`
+	Size       int64 `gorm:"default:0"`
+	Checksum   string
+	CreatedAt  int64 `gorm:"autoCreateTime"`
 }
 
 // VersionChunk 文件版本到存储 chunk 的映射。
@@ -237,12 +241,12 @@ type VersionChunk struct {
 
 // InodeHistory 记录 inode 的创建、改名、移动、删除事件。
 type InodeHistory struct {
-	Id           int64          `gorm:"primaryKey;autoIncrement"`
-	InodeId      int64          `gorm:"index;not null"`
-	EventType    InodeEventType `gorm:"not null"`
-	OldName      *string
-	NewName      *string
-	OldParentId  *int64
-	NewParentId  *int64
-	CreatedAt    int64          `gorm:"autoCreateTime;index"`
+	Id          int64          `gorm:"primaryKey;autoIncrement"`
+	InodeId     int64          `gorm:"index;not null"`
+	EventType   InodeEventType `gorm:"not null"`
+	OldName     sql.NullString
+	NewName     sql.NullString
+	OldParentId sql.NullInt64
+	NewParentId sql.NullInt64
+	CreatedAt   int64 `gorm:"autoCreateTime;index"`
 }
