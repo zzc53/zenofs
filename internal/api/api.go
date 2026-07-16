@@ -164,7 +164,7 @@ func NewRouter(pm *pool.PoolManager) *chi.Mux {
 		// ── Repair ──
 		r.Post("/pools/{poolId}/reconstruct", func(w http.ResponseWriter, r *http.Request) {
 			poolId, _ := strconv.ParseInt(chi.URLParam(r, "poolId"), 10, 64)
-			pm.ReconstructStripes(poolId)
+			go pm.ReconstructStripes(poolId)
 			respondJSON(w, http.StatusOK, map[string]string{"status": "reconstruct started"})
 		})
 	})
