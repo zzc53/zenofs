@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"sync"
@@ -159,7 +160,12 @@ func (p *PoolManager) computeStripe(stripeId int64, dataShards, parityShards int
 }
 
 // processWriteQueue 处理 parity：一次加载所有数据 → 并发计算 RS → 一次批量写库。
-func (p *PoolManager) processWriteQueue() {
+// 返回是否有任务处理过（用于调用方做空闲退避）。
+func (p *PoolManager) processWriteQueue() bool {
+	// 清理上次残留的 QueueProcessing（异常中断遗留）
+	p.DbManager.DB.Model(&db.WriteQueue{}).
+		Where("status = ?", db.QueueProcessing).Update("status", db.QueuePending)
+
 	// 事务内原子地领走 QueuePending 条目
 	var entries []db.WriteQueue
 	err := p.DbManager.DB.Transaction(func(tx *gorm.DB) error {
@@ -180,10 +186,10 @@ func (p *PoolManager) processWriteQueue() {
 	})
 	if err != nil {
 		log.Printf("parity: claim pending entries failed: %v", err)
-		return
+		return false
 	}
 	if len(entries) == 0 {
-		return
+		return false
 	}
 
 	// 收集去重的 stripe ID
@@ -200,7 +206,7 @@ func (p *PoolManager) processWriteQueue() {
 	var stripes []db.Stripe
 	if err := p.DbManager.DB.Where("id IN ?", stripeIds).Find(&stripes).Error; err != nil {
 		log.Printf("parity: query stripes failed: %v", err)
-		return
+		return false
 	}
 	poolMap := make(map[int64]int64)
 	poolSet := make(map[int64]struct{})
@@ -216,7 +222,7 @@ func (p *PoolManager) processWriteQueue() {
 	var pools []db.Pool
 	if err := p.DbManager.DB.Where("id IN ?", poolIds).Find(&pools).Error; err != nil {
 		log.Printf("parity: query pools failed: %v", err)
-		return
+		return false
 	}
 	poolConfig := make(map[int64]struct{ DataShards, ParityShards int64 })
 	for _, pl := range pools {
@@ -226,7 +232,7 @@ func (p *PoolManager) processWriteQueue() {
 	var disks []db.Disk
 	if err := p.DbManager.DB.Where("pool_id IN ?", poolIds).Find(&disks).Error; err != nil {
 		log.Printf("parity: query disks failed: %v", err)
-		return
+		return false
 	}
 	diskById := make(map[int64]db.Disk, len(disks))
 	for i := range disks {
@@ -237,7 +243,7 @@ func (p *PoolManager) processWriteQueue() {
 	var allChunks []db.Chunk
 	if err := p.DbManager.DB.Where("stripe_id IN ?", stripeIds).Find(&allChunks).Error; err != nil {
 		log.Printf("parity: query chunks failed: %v", err)
-		return
+		return false
 	}
 
 	type stripeJob struct {
@@ -327,7 +333,7 @@ func (p *PoolManager) processWriteQueue() {
 	})
 	if err != nil {
 		log.Printf("parity: phase1 failed: %v", err)
-		return
+		return false
 	}
 
 	// ── 并发计算 RS parity（无 DB 操作）──
@@ -359,9 +365,9 @@ func (p *PoolManager) processWriteQueue() {
 
 	// 收集计算结果
 	type parityUpdate struct {
-		id     int64
-		size   int64
-		hash   []byte
+		id   int64
+		size int64
+		hash []byte
 	}
 	var allDataIds []int64
 	var allParityUpdates []parityUpdate
@@ -420,45 +426,42 @@ func (p *PoolManager) processWriteQueue() {
 			}
 		}
 		// 标记 WriteQueue 完成
-		return tx.Model(&db.WriteQueue{}).
-			Where("status = ?", db.QueueProcessing).Update("status", db.QueueDone).Error
+		return tx.Where("status = ?", db.QueueProcessing).Delete(&db.WriteQueue{}).Error
 	})
 	if err != nil {
 		log.Printf("parity: phase2 failed: %v", err)
-		return
+		return false
 	}
 
 	log.Printf("parity: batch done (%d stripes, %d data, %d parity)",
 		len(stripeIds), len(allDataIds), len(allParityUpdates))
+	return true
 }
 
-// StartParityWorker 启动后台 goroutine，监听 WriteQueue channel。
-func (p *PoolManager) StartParityWorker(batchSize int) {
-	if batchSize <= 0 {
-		batchSize = 100
-	}
-	interval := 1 * time.Second
-
+// StartParityWorker 启动后台 goroutine，按上下文退避轮询 DB 处理 parity。
+// ctx 取消时等待当前批次完成后退出 goroutine。
+func (p *PoolManager) StartParityWorker(ctx context.Context) {
 	go func() {
+		interval := 1 * time.Second
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
-
-		var pending int
 		for {
 			select {
-			case entries := <-p.WriteQueue:
-				pending += len(entries)
-				if pending >= batchSize {
-					p.processWriteQueue()
-					pending = 0
-				}
+			case <-ctx.Done():
+				return
 			case <-ticker.C:
-				if pending > 0 {
-					p.processWriteQueue()
-					pending = 0
+				hadWork := p.processWriteQueue()
+				if hadWork {
+					interval = 1 * time.Second
+				} else {
+					interval *= 2
+					if interval > 5*time.Second {
+						interval = 5 * time.Second
+					}
 				}
+				ticker.Reset(interval)
 			}
 		}
 	}()
-	log.Printf("parity worker started (batch=%d, interval=%v)", batchSize, interval)
+	log.Printf("parity worker started (interval=1s, max_backoff=5s)")
 }

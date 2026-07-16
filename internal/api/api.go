@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"strconv"
 
@@ -36,7 +37,7 @@ func respondErr(w http.ResponseWriter, err error) {
 }
 
 // NewRouter 创建并返回配置好所有路由的 chi Router。
-func NewRouter(pm *pool.PoolManager, _ *db.DbManager) *chi.Mux {
+func NewRouter(pm *pool.PoolManager) *chi.Mux {
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
@@ -117,53 +118,47 @@ func NewRouter(pm *pool.PoolManager, _ *db.DbManager) *chi.Mux {
 		// ── Chunk ──
 		r.Post("/pools/{poolId}/chunks", func(w http.ResponseWriter, r *http.Request) {
 			poolId, _ := strconv.ParseInt(chi.URLParam(r, "poolId"), 10, 64)
-			var body struct {
-				Data [][]byte `json:"data"`
-			}
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-				respondJSON(w, http.StatusBadRequest, apiError{Message: "invalid json"})
+			data, err := io.ReadAll(r.Body)
+			if err != nil {
+				respondJSON(w, http.StatusBadRequest, apiError{Message: "read body failed"})
 				return
 			}
-			chunks, err := pm.AddChunks(poolId, body.Data)
+			c, err := pm.AddChunk(poolId, data)
 			if err != nil {
 				respondErr(w, err)
 				return
 			}
-			respondJSON(w, http.StatusCreated, chunks)
+			respondJSON(w, http.StatusCreated, c)
 		})
 
-		r.Post("/chunks/write", func(w http.ResponseWriter, r *http.Request) {
-			var body struct {
-				PoolId int64                `json:"pool_id"`
-				Items  []pool.WriteChunkItem `json:"items"`
-			}
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-				respondJSON(w, http.StatusBadRequest, apiError{Message: "invalid json"})
-				return
-			}
-			chunks, err := pm.WriteChunks(body.PoolId, body.Items)
+		r.Get("/chunks/{id}", func(w http.ResponseWriter, r *http.Request) {
+			id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+			poolId, err := chunkPoolID(pm, id)
 			if err != nil {
 				respondErr(w, err)
 				return
 			}
-			respondJSON(w, http.StatusOK, chunks)
+			data, err := pm.ReadChunks(poolId, []int64{id})
+			if err != nil {
+				respondErr(w, err)
+				return
+			}
+			w.Write(data[0])
 		})
 
-		r.Post("/chunks/read", func(w http.ResponseWriter, r *http.Request) {
-			var body struct {
-				PoolId   int64   `json:"pool_id"`
-				ChunkIds []int64 `json:"chunk_ids"`
-			}
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-				respondJSON(w, http.StatusBadRequest, apiError{Message: "invalid json"})
+		r.Put("/chunks/{id}", func(w http.ResponseWriter, r *http.Request) {
+			id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+			data, err := io.ReadAll(r.Body)
+			if err != nil {
+				respondJSON(w, http.StatusBadRequest, apiError{Message: "read body failed"})
 				return
 			}
-			data, err := pm.ReadChunks(body.PoolId, body.ChunkIds)
+			chunks, err := pm.WriteChunks([]pool.WriteChunkItem{{ChunkId: id, Data: data}})
 			if err != nil {
 				respondErr(w, err)
 				return
 			}
-			respondJSON(w, http.StatusOK, map[string]any{"data": data})
+			respondJSON(w, http.StatusOK, chunks[0])
 		})
 
 		// ── Repair ──
@@ -175,4 +170,17 @@ func NewRouter(pm *pool.PoolManager, _ *db.DbManager) *chi.Mux {
 	})
 
 	return r
+}
+
+// chunkPoolID 通过 chunk 的 stripe 推导 poolId。
+func chunkPoolID(pm *pool.PoolManager, chunkId int64) (int64, error) {
+	var chunk db.Chunk
+	if err := pm.DbManager.DB.First(&chunk, chunkId).Error; err != nil {
+		return 0, err
+	}
+	var stripe db.Stripe
+	if err := pm.DbManager.DB.First(&stripe, chunk.StripeId).Error; err != nil {
+		return 0, err
+	}
+	return stripe.PoolId, nil
 }

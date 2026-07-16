@@ -1,13 +1,14 @@
 package pool
 
 import (
+	"encoding/binary"
 	"fmt"
 	"path"
 	"strconv"
 	"sync"
 	"time"
 
-	"crypto/rand"
+	cryptorand "crypto/rand"
 
 	mrand "math/rand"
 
@@ -22,7 +23,7 @@ func generateSecureRandomString(length int) (string, error) {
 	const charset = "abcdefghijklmnopqrstuvwxyz234567"
 	b := make([]byte, length)
 
-	_, err := rand.Read(b)
+	_, err := cryptorand.Read(b)
 	if err != nil {
 		return "", err
 	}
@@ -31,6 +32,13 @@ func generateSecureRandomString(length int) (string, error) {
 		b[i] = charset[int(b[i])%len(charset)]
 	}
 	return string(b), nil
+}
+
+// cryptoRandSeed 用 crypto/rand 生成一个 int64 随机种子。
+func cryptoRandSeed() int64 {
+	var buf [8]byte
+	cryptorand.Read(buf[:])
+	return int64(binary.LittleEndian.Uint64(buf[:]))
 }
 
 // AddChunk 兼容包装：单 chunk 写入。
@@ -115,7 +123,7 @@ func (p *PoolManager) AddChunks(poolId int64, dataList [][]byte) ([]db.Chunk, er
 			Model(&db.Chunk{}).
 			Select("chunks.*").
 			Joins("JOIN stripes ON chunks.stripe_id = stripes.id").
-			Where("chunks.status = ? AND stripes.pool_id = ?", db.ChunkReserved, poolId).
+			Where("chunks.status = ? AND chunks.type = ? AND stripes.pool_id = ?", db.ChunkReserved, db.DataChunk, poolId).
 			Limit(N).
 			Find(&reserved).Error; err != nil {
 			return errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
@@ -159,7 +167,7 @@ func (p *PoolManager) AddChunks(poolId int64, dataList [][]byte) ([]db.Chunk, er
 				}
 
 				shuffled := append([]db.Disk{}, disks...)
-				mrand.New(mrand.NewSource(stripe.Id)).Shuffle(len(shuffled), func(i, j int) {
+				mrand.New(mrand.NewSource(cryptoRandSeed())).Shuffle(len(shuffled), func(i, j int) {
 					shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
 				})
 
@@ -273,12 +281,11 @@ func (p *PoolManager) AddChunks(poolId int64, dataList [][]byte) ([]db.Chunk, er
 		}
 	}
 	if firstErr != nil {
-		// 批量更新：写失败的标记 Error，写成功的标记 Updated
-		var errorIds, successIds []int64
 		failed := make(map[int]bool, len(failedIdx))
 		for _, idx := range failedIdx {
 			failed[idx] = true
 		}
+		var errorIds, successIds []int64
 		for i, c := range chunks {
 			if failed[i] {
 				errorIds = append(errorIds, c.Id)
@@ -291,9 +298,23 @@ func (p *PoolManager) AddChunks(poolId int64, dataList [][]byte) ([]db.Chunk, er
 		}
 		if len(successIds) > 0 {
 			p.DbManager.DB.Model(&db.Chunk{}).Where("id IN ?", successIds).Update("status", db.ChunkUpdated)
+			var wq []db.WriteQueue
+			for i, c := range chunks {
+				if !failed[i] {
+					wq = append(wq, db.WriteQueue{ChunkId: c.Id, StripeId: c.StripeId})
+				}
+			}
+			p.DbManager.DB.Create(&wq)
 		}
 		return nil, firstErr
 	}
+
+	// 全部写入成功
+	ids := make([]int64, len(chunks))
+	for i, c := range chunks {
+		ids[i] = c.Id
+	}
+	p.DbManager.DB.Model(&db.Chunk{}).Where("id IN ?", ids).Update("status", db.ChunkUpdated)
 
 	// 批量写 WriteQueue（即 parity 队列）
 	writeEntries := make([]db.WriteQueue, len(chunks))
@@ -306,7 +327,6 @@ func (p *PoolManager) AddChunks(poolId int64, dataList [][]byte) ([]db.Chunk, er
 	if err := p.DbManager.DB.Create(&writeEntries).Error; err != nil {
 		return nil, errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
 	}
-	p.WriteQueue <- writeEntries
 
 	return chunks, nil
 }
@@ -327,18 +347,10 @@ type WriteChunkItem struct {
 }
 
 // WriteChunks 向已分配的 chunk（通过 ChunkId）写入数据。
-// 常用于 parity worker 回填校验块。不分配新 stripe，不查重。
-func (p *PoolManager) WriteChunks(poolId int64, items []WriteChunkItem) ([]db.Chunk, error) {
+// poolId 从 chunk 所属 stripe 自动推导，不跨 pool。
+func (p *PoolManager) WriteChunks(items []WriteChunkItem) ([]db.Chunk, error) {
 	if len(items) == 0 {
 		return nil, errs.New(errs.ECODE_CHUNK_EMPTY, errs.ESTR_CHUNK_EMPTY, "empty items", "")
-	}
-
-	pool, err := p.GetPool(poolId)
-	if err != nil {
-		return nil, err
-	}
-	if pool.Status != db.Online {
-		return nil, errs.New(errs.ECODE_POOL_OFFLINE, errs.ESTR_POOL_OFFLINE, "pool is offline", strconv.FormatInt(poolId, 10))
 	}
 
 	N := len(items)
@@ -363,28 +375,44 @@ func (p *PoolManager) WriteChunks(poolId int64, items []WriteChunkItem) ([]db.Ch
 		}
 	}
 
-	maxSize := pool.ChunkSize * 1024
-	for _, it := range prep {
-		if int64(it.size) > maxSize {
-			return nil, errs.New(errs.ECODE_CHUNK_SIZE_EXCEED, errs.ESTR_CHUNK_SIZE_EXCEED,
-				"data exceeds pool chunk size", strconv.FormatInt(maxSize, 10))
-		}
-	}
-
-	// 一次查出所有 chunk，验证属于该 pool
+	// 一次查出所有 chunk 及所属 pool
 	chunkIds := make([]int64, N)
 	for i, it := range prep {
 		chunkIds[i] = it.chunkId
 	}
 	var chunks []db.Chunk
 	if err := p.DbManager.DB.Joins("JOIN stripes ON chunks.stripe_id = stripes.id").
-		Where("chunks.id IN ? AND stripes.pool_id = ?", chunkIds, poolId).
-		Find(&chunks).Error; err != nil {
+		Where("chunks.id IN ?", chunkIds).Find(&chunks).Error; err != nil {
 		return nil, errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
 	}
 	if len(chunks) != N {
 		return nil, errs.New(errs.ECODE_CHUNK_NOT_FOUND, errs.ESTR_CHUNK_NOT_FOUND,
-			"some chunks not found or not in pool", strconv.FormatInt(poolId, 10))
+			"some chunks not found", "")
+	}
+
+	// 推导 poolId，校验 pool 在线
+	poolId := int64(0)
+	{
+		var stripe db.Stripe
+		if err := p.DbManager.DB.First(&stripe, chunks[0].StripeId).Error; err != nil {
+			return nil, errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
+		}
+		poolId = stripe.PoolId
+	}
+	pool, err := p.GetPool(poolId)
+	if err != nil {
+		return nil, err
+	}
+	if pool.Status != db.Online {
+		return nil, errs.New(errs.ECODE_POOL_OFFLINE, errs.ESTR_POOL_OFFLINE, "pool is offline", strconv.FormatInt(poolId, 10))
+	}
+
+	maxSize := pool.ChunkSize * 1024
+	for _, it := range prep {
+		if int64(it.size) > maxSize {
+			return nil, errs.New(errs.ECODE_CHUNK_SIZE_EXCEED, errs.ESTR_CHUNK_SIZE_EXCEED,
+				"data exceeds pool chunk size", strconv.FormatInt(maxSize, 10))
+		}
 	}
 
 	// 按 chunk ID 建索引保持顺序
@@ -480,9 +508,23 @@ func (p *PoolManager) WriteChunks(poolId int64, items []WriteChunkItem) ([]db.Ch
 		}
 		if len(successIds) > 0 {
 			p.DbManager.DB.Model(&db.Chunk{}).Where("id IN ?", successIds).Update("status", db.ChunkUpdated)
+			var wq []db.WriteQueue
+			for i, c := range ordered {
+				if !failed[i] {
+					wq = append(wq, db.WriteQueue{ChunkId: c.Id, StripeId: c.StripeId})
+				}
+			}
+			p.DbManager.DB.Create(&wq)
 		}
 		return nil, firstErr
 	}
+
+	// 全部写入成功，标记 Updated
+	allIds := make([]int64, N)
+	for i := range ordered {
+		allIds[i] = ordered[i].Id
+	}
+	p.DbManager.DB.Model(&db.Chunk{}).Where("id IN ?", allIds).Update("status", db.ChunkUpdated)
 
 	writeEntries := make([]db.WriteQueue, N)
 	for i := range ordered {
@@ -494,7 +536,6 @@ func (p *PoolManager) WriteChunks(poolId int64, items []WriteChunkItem) ([]db.Ch
 	if err := p.DbManager.DB.Create(&writeEntries).Error; err != nil {
 		return nil, errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
 	}
-	p.WriteQueue <- writeEntries
 
 	return ordered, nil
 }

@@ -22,7 +22,7 @@ func New(url string) (*DbManager, error) {
 	var dial gorm.Dialector
 
 	if strings.HasPrefix(url, "sqlite://") {
-		dial = sqlite.Open(strings.Replace(url, "sqlite://", "", 1) + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)")
+		dial = sqlite.Open(strings.Replace(url, "sqlite://", "", 1) + "?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
 	} else if strings.HasPrefix(url, "mysql://") {
 		dial = mysql.Open(url)
 	} else if strings.HasPrefix(url, "postgres://") {
@@ -52,5 +52,27 @@ func (m *DbManager) Close() error {
 
 // AutoMigrate 自动迁移给定的模型。
 func (m *DbManager) AutoMigrate() error {
-	return m.DB.AutoMigrate(&Pool{}, &Disk{}, &Chunk{}, &Stripe{}, &WriteQueue{}, &ReadCache{})
+	if err := m.DB.AutoMigrate(&Pool{}, &Disk{}, &Chunk{}, &Stripe{}, &WriteQueue{}, &ReadCache{}, &Setting{}, &Task{}); err != nil {
+		return err
+	}
+	// 首次运行时写入默认配置
+	var count int64
+	m.DB.Model(&Setting{}).Count(&count)
+	if count == 0 {
+		defaults := []Setting{
+			{Name: "HTTP_PORT", Value: "8080"},
+			{Name: "ACTION_LOCK", Value: "0"},
+		}
+		m.DB.Create(&defaults)
+	}
+	return nil
+}
+
+// GetSetting 返回指定名称的配置值，不存在时返回 fallback。
+func (m *DbManager) GetSetting(name, fallback string) string {
+	var s Setting
+	if err := m.DB.Where("name = ?", name).First(&s).Error; err != nil {
+		return fallback
+	}
+	return s.Value
 }

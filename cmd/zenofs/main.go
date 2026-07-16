@@ -1,9 +1,13 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/zzc53/zenofs/internal/api"
 	"github.com/zzc53/zenofs/internal/config"
@@ -24,15 +28,55 @@ func main() {
 	}
 	defer dbManager.Close()
 
-	ch := make(chan []db.WriteQueue, 1000)
-	pm := pool.New(dbManager, ch, []pool.ChunkHandler{pool.NewLocalChunkHandler()})
-	pm.StartParityWorker(100)
+	// 配置连接池
+	sqlDB, err := dbManager.DB.DB()
+	if err != nil {
+		log.Fatalf("failed to get underlying sql.DB: %+v", err)
+	}
+	sqlDB.SetMaxOpenConns(25)
+	sqlDB.SetMaxIdleConns(10)
+	sqlDB.SetConnMaxLifetime(5 * time.Minute)
 
-	r := api.NewRouter(pm, dbManager)
+	pm := pool.New(dbManager, []pool.ChunkHandler{pool.NewLocalChunkHandler()})
 
-	addr := ":8080"
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pm.StartParityWorker(ctx)
+
+	r := api.NewRouter(pm)
+
+	port := dbManager.GetSetting("HTTP_PORT", "8080")
+	addr := ":" + port
+
+	srv := &http.Server{
+		Addr:         addr,
+		Handler:      r,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	// 优雅关闭：捕获 SIGINT/SIGTERM
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		sig := <-sigCh
+		log.Printf("received signal %v, shutting down...", sig)
+
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer shutdownCancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("HTTP server shutdown error: %v", err)
+		}
+		cancel() // 通知 parity worker 退出
+	}()
+
 	log.Printf("zenofs API listening on %s", addr)
-	if err := http.ListenAndServe(addr, r); err != nil {
+	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
+
+	// 等待 parity worker 完成当前批次
+	<-ctx.Done()
+	log.Println("server stopped gracefully")
 }

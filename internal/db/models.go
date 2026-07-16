@@ -87,7 +87,6 @@ type WriteQueueStatus int8
 const (
 	QueuePending WriteQueueStatus = iota
 	QueueProcessing
-	QueueDone
 )
 
 type WriteQueue struct {
@@ -106,4 +105,32 @@ type ReadCache struct {
 	CreatedAt int64 `gorm:"autoCreateTime;index"`
 	UpdatedAt int64 `gorm:"autoUpdateTime;index"`
 	ExpiredAt int64 `gorm:"index"`
+}
+
+type Setting struct {
+	Id        int64  `gorm:"primaryKey"`
+	Name      string `gorm:"uniqueIndex"`
+	Value     string
+	CreatedAt int64 `gorm:"autoCreateTime;index"`
+	UpdatedAt int64 `gorm:"autoUpdateTime;index"`
+}
+
+type TaskStatus int8
+
+const (
+	TaskPending TaskStatus = iota
+	TaskRunning
+	TaskFinished
+)
+
+// Task 记录历史任务，同名任务只能有一个 Pending 或 Running。
+type Task struct {
+	Id        int64      `gorm:"primaryKey"`
+	Name      string     `gorm:"index"`
+	Status    TaskStatus `gorm:"index"`
+	Message   string
+	PoolId    int64
+	DiskId    int64
+	CreatedAt int64      `gorm:"autoCreateTime;index"`
+	UpdatedAt int64      `gorm:"autoUpdateTime"`
 }
