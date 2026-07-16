@@ -17,7 +17,11 @@ type DbManager struct {
 	DB *gorm.DB
 }
 
-// New 根据配置创建一个 GORM 数据库连接。
+// New 根据 URL 前缀自动选择 SQLite/MySQL/PostgreSQL 驱动建立连接。
+// 支持三种 URL 格式：
+//   sqlite:///path/to/db   — SQLite（自动启用 WAL 模式）
+//   mysql://user:pass@tcp(host:port)/dbname
+//   postgres://user:pass@host:port/dbname
 func New(url string) (*DbManager, error) {
 	var dial gorm.Dialector
 

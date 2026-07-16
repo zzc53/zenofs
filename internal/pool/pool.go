@@ -12,11 +12,15 @@ import (
 	"github.com/zzc53/zenofs/internal/db"
 )
 
+// PoolManager 管理存储池、磁盘、chunk 的元数据和操作。
+// 包含 DB 连接和一组 ChunkHandler（按 disk.Backend 匹配使用）。
 type PoolManager struct {
 	DbManager *db.DbManager
 	Handlers  []ChunkHandler
 }
 
+// New 创建 PoolManager。
+// handlers 是按 Backend 类型提供的 ChunkHandler 列表，用于读写数据。
 func New(dbManager *db.DbManager, handlers []ChunkHandler) *PoolManager {
 	return &PoolManager{
 		DbManager: dbManager,
@@ -24,6 +28,7 @@ func New(dbManager *db.DbManager, handlers []ChunkHandler) *PoolManager {
 	}
 }
 
+// checkPoolName 检查 pool 名称是否已存在。
 func (p *PoolManager) checkPoolName(name string) error {
 	var existingPool db.Pool
 	if p.DbManager.DB.Where("name = ?", name).First(&existingPool).Error == nil && existingPool.Id > 0 {
@@ -32,6 +37,7 @@ func (p *PoolManager) checkPoolName(name string) error {
 	return nil
 }
 
+// GetPool 按 ID 查询存储池。
 func (p *PoolManager) GetPool(id int64) (*db.Pool, error) {
 	var existingPool db.Pool
 	if p.DbManager.DB.Where("id = ?", id).First(&existingPool).Error != nil {
@@ -40,6 +46,8 @@ func (p *PoolManager) GetPool(id int64) (*db.Pool, error) {
 	return &existingPool, nil
 }
 
+// AddPool 创建一个新的存储池。
+// chunkSizeKb 范围 1~65536 KB（最大 64MB）。
 func (p *PoolManager) AddPool(name string, chunkSizeKb int64) (*db.Pool, error) {
 	if chunkSizeKb <= 0 || chunkSizeKb > 64*1024 {
 		return nil, errs.New(errs.ECODE_POOL_BAD, errs.ESTR_POOL_BAD, "chunk size must be 1-65536 KB (max 64MB)", strconv.FormatInt(chunkSizeKb, 10))
@@ -65,6 +73,10 @@ func (p *PoolManager) AddPool(name string, chunkSizeKb int64) (*db.Pool, error) 
 	return &pool, nil
 }
 
+// AddDisk 向存储池添加一块磁盘。
+// diskType 支持 DataDisk（参与条带化）和 CacheDisk（仅做读缓存）。
+// addParity=true 时将新盘标记为 parity 盘并递增 ParityShards。
+// CacheDisk 不参与条带化，直接创建并返回。
 func (p *PoolManager) AddDisk(poolId int64, path string, diskBackend int8, diskType int8, addParity bool) (*db.Disk, error) {
 	if err := p.acquireLock("add_disk", "add disk", poolId, 0, ""); err != nil {
 		return nil, err

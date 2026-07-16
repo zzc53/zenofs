@@ -130,9 +130,8 @@ func (p *PoolManager) cleanupExpiredCache() {
 	}
 
 	ids := make([]int64, len(entries))
-	for i, e := range entries {
-		ids[i] = e.Id
-		_ = e
+	for i := range entries {
+		ids[i] = entries[i].Id
 	}
 
 	if err := p.DbManager.DB.Where("id IN ?", ids).Delete(&db.ReadCache{}).Error; err != nil {

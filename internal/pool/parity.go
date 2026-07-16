@@ -14,7 +14,7 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-// handlerFor 返回匹配 disk.Backend 的 ChunkHandler。
+// handlerFor 遍历已注册的 ChunkHandler 列表，返回匹配 disk.Backend 的第一个 handler。
 func (p *PoolManager) handlerFor(backend db.DiskBackend) ChunkHandler {
 	for _, h := range p.Handlers {
 		if h.Type() == backend {
@@ -24,20 +24,36 @@ func (p *PoolManager) handlerFor(backend db.DiskBackend) ChunkHandler {
 	return nil
 }
 
-// computeStripe 纯计算函数：读取 data chunk → RS 编码 → 写入 parity 到磁盘。
-// 不涉及任何 DB 操作，调用方负责提供元数据并处理结果更新。
+// stripeResult 保存一次 RS 编码后单个 parity shard 的计算结果。
 type stripeResult struct {
-	parityIdx  int64 // parity index
-	parityData []byte
-	parityHash [32]byte
+	parityIdx  int64    // parity shard 的序号
+	parityData []byte   // parity shard 的原始数据
+	parityHash [32]byte // parity shard 的 BLAKE3 哈希
 }
 
+// computeStripe 对一个 stripe 执行完整的 RS 编码流程。
+//
+// 流程：
+//  1. 并发读取该 stripe 的所有 data chunk（从磁盘）
+//  2. 将所有 data shard padding 到等长（RS 编码要求）
+//  3. 调用 Reed-Solomon 编码生成 parity shard
+//  4. 并发将 parity shard 写入磁盘
+//  5. 计算每个 parity shard 的 BLAKE3 哈希返回
+//
+// 返回 ([]stripeResult, true) 表示成功，否则返回 (nil, false)。
 func (p *PoolManager) computeStripe(stripeId int64, dataShards, parityShards int,
 	dataChunks []db.Chunk, parityByIndex map[int64]db.Chunk, diskById map[int64]db.Disk) ([]stripeResult, bool) {
 
+	// ---------------------------------------------------------------
+	// 第一步：分配 shard 数组。shards[0..dataShards-1] 放 data，
+	// shards[dataShards..] 放 parity。
+	// ---------------------------------------------------------------
 	shards := make([][]byte, dataShards+parityShards)
 
-	// 并行读 data chunk
+	// ---------------------------------------------------------------
+	// 第二步：并发读取所有 data chunk 的数据。
+	// 每个 goroutine 读取一个 chunk，通过 channel 收集结果。
+	// ---------------------------------------------------------------
 	type readRes struct {
 		idx  int64
 		data []byte
@@ -49,23 +65,28 @@ func (p *PoolManager) computeStripe(stripeId int64, dataShards, parityShards int
 		readWg.Add(1)
 		go func(c db.Chunk) {
 			defer readWg.Done()
+			// 根据 chunk.DiskId 找到对应的物理磁盘
 			disk, ok := diskById[c.DiskId]
 			if !ok {
 				readCh <- readRes{c.Index, nil, fmt.Errorf("disk %d not found", c.DiskId)}
 				return
 			}
+			// 根据磁盘后端类型找到对应的读写 handler
 			h := p.handlerFor(disk.Backend)
 			if h == nil {
 				readCh <- readRes{c.Index, nil, fmt.Errorf("no handler for backend %d", disk.Backend)}
 				return
 			}
+			// 从磁盘完整读取 chunk 数据
 			data, err := h.Read(disk, c.Path)
 			readCh <- readRes{c.Index, data, err}
 		}(c)
 	}
+	// 等待所有并发读取完成，关闭 channel
 	readWg.Wait()
 	close(readCh)
 
+	// 收集读取结果，按 index 填入 shards 数组
 	for r := range readCh {
 		if r.err != nil {
 			log.Printf("parity: stripe %d read data index %d failed: %v", stripeId, r.idx, r.err)
@@ -74,13 +95,18 @@ func (p *PoolManager) computeStripe(stripeId int64, dataShards, parityShards int
 		shards[r.idx] = r.data
 	}
 
-	// 补齐 data shard 到等长（RS 要求所有 shard 等长）
+	// ---------------------------------------------------------------
+	// 第三步：将所有 data shard padding 到等长。
+	// RS 编码要求输入的所有 shard 长度一致。找出最长的一个，
+	// 将其余不足的 shard 用 0 padding 补足。
+	// ---------------------------------------------------------------
 	var maxSize int
 	for _, s := range shards[:dataShards] {
 		if len(s) > maxSize {
 			maxSize = len(s)
 		}
 	}
+	// 不足等长的 shard 拷贝到新的 padded 数组
 	for i := 0; i < dataShards; i++ {
 		if len(shards[i]) < maxSize {
 			padded := make([]byte, maxSize)
@@ -88,18 +114,21 @@ func (p *PoolManager) computeStripe(stripeId int64, dataShards, parityShards int
 			shards[i] = padded
 		}
 	}
-	// 未写入 slot 用全零填充
+	// stripe 中未写入的 slot（比如 batch 不足 dataShards 个）用全零填充
 	for i := 0; i < dataShards; i++ {
 		if shards[i] == nil {
 			shards[i] = make([]byte, maxSize)
 		}
 	}
-	// parity slot 预分配
+	// 预分配 parity shard 的空间
 	for i := dataShards; i < dataShards+parityShards; i++ {
 		shards[i] = make([]byte, maxSize)
 	}
 
-	// RS 编码
+	// ---------------------------------------------------------------
+	// 第四步：初始化 Reed-Solomon 编码器，执行编码。
+	// 编码完成后 shards[dataShards..] 中存放的是计算出的 parity 数据。
+	// ---------------------------------------------------------------
 	enc, err := reedsolomon.New(dataShards, parityShards)
 	if err != nil {
 		log.Printf("parity: new encoder failed: %v", err)
@@ -110,7 +139,10 @@ func (p *PoolManager) computeStripe(stripeId int64, dataShards, parityShards int
 		return nil, false
 	}
 
-	// 并行写 parity 到磁盘
+	// ---------------------------------------------------------------
+	// 第五步：并发将 parity shard 写入磁盘。
+	// 每个 goroutine 写入一个 parity shard，通过 channel 收集结果。
+	// ---------------------------------------------------------------
 	type writeRes struct {
 		idx int64
 		err error
@@ -121,17 +153,20 @@ func (p *PoolManager) computeStripe(stripeId int64, dataShards, parityShards int
 		writeWg.Add(1)
 		go func(idx int) {
 			defer writeWg.Done()
-			parityData := shards[dataShards+idx]
+			parityData := shards[dataShards+idx] // 取第 idx 个 parity shard 的数据
+			// 根据 index 查找预分配的 parity chunk 元数据
 			c, ok := parityByIndex[int64(idx)]
 			if !ok {
 				writeCh <- writeRes{int64(idx), fmt.Errorf("parity %d not found", idx)}
 				return
 			}
+			// 找到 parity chunk 所在的磁盘
 			disk, ok := diskById[c.DiskId]
 			if !ok {
 				writeCh <- writeRes{int64(idx), fmt.Errorf("disk %d not found", c.DiskId)}
 				return
 			}
+			// 找到对应的 handler 并写入磁盘
 			h := p.handlerFor(disk.Backend)
 			if h == nil {
 				writeCh <- writeRes{int64(idx), fmt.Errorf("no handler for backend %d", disk.Backend)}
@@ -140,9 +175,13 @@ func (p *PoolManager) computeStripe(stripeId int64, dataShards, parityShards int
 			writeCh <- writeRes{int64(idx), h.Write(disk, c.Path, parityData)}
 		}(i)
 	}
+	// 等待所有并发写入完成
 	writeWg.Wait()
 	close(writeCh)
 
+	// ---------------------------------------------------------------
+	// 第六步：收集写入结果，写入成功则计算 BLAKE3 哈希一并返回。
+	// ---------------------------------------------------------------
 	var results []stripeResult
 	for r := range writeCh {
 		if r.err != nil {
@@ -159,14 +198,31 @@ func (p *PoolManager) computeStripe(stripeId int64, dataShards, parityShards int
 	return results, true
 }
 
-// processWriteQueue 处理 parity：一次加载所有数据 → 并发计算 RS → 一次批量写库。
-// 返回是否有任务处理过（用于调用方做空闲退避）。
+// processWriteQueue 是 parity worker 的核心调度函数。
+//
+// 整体流程：
+//  1. 清理上次意外残留的 QueueProcessing 条目
+//  2. 在一个事务中原子地领走一批 QueuePending 条目（SKIP LOCKED 避免竞争）
+//  3. 按 stripe 去重，加载 stripe/pool/disk/chunk 元数据
+//  4. Phase 1: 锁定 parity chunk 并标记为 Pending（防止并发写入）
+//  5. 并发调用 computeStripe 对每个 stripe 执行 RS 编码（最多 4 路并发）
+//  6. Phase 2: 在一个事务中批量更新 data chunk→Active、parity chunk→Active、删除已处理的 WriteQueue
+//
+// 返回 true 表示处理了至少一个条目，false 表示空闲。
 func (p *PoolManager) processWriteQueue() bool {
-	// 清理上次残留的 QueueProcessing（异常中断遗留）
+	// ---------------------------------------------------------------
+	// Step 1: 清理上次异常中断残留的 QueueProcessing 条目。
+	// 如果进程在上次批次中间崩溃，这些条目会永远卡在 Processing 状态。
+	// 将它们重置为 Pending，让本次重新处理。
+	// ---------------------------------------------------------------
 	p.DbManager.DB.Model(&db.WriteQueue{}).
 		Where("status = ?", db.QueueProcessing).Update("status", db.QueuePending)
 
-	// 事务内原子地领走 QueuePending 条目
+	// ---------------------------------------------------------------
+	// Step 2: 在一个事务中原子地领走一批 QueuePending 条目。
+	// 使用 SKIP LOCKED 避免多个 parity worker（如果有）之间的锁竞争。
+	// 领走后将状态改为 QueueProcessing，防止被其他 worker 重复领取。
+	// ---------------------------------------------------------------
 	var entries []db.WriteQueue
 	err := p.DbManager.DB.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
@@ -192,7 +248,9 @@ func (p *PoolManager) processWriteQueue() bool {
 		return false
 	}
 
-	// 收集去重的 stripe ID
+	// ---------------------------------------------------------------
+	// Step 3: 从 WriteQueue 条目中提取出所有涉及的 stripe ID（去重）。
+	// ---------------------------------------------------------------
 	stripeSet := make(map[int64]struct{})
 	for _, e := range entries {
 		stripeSet[e.StripeId] = struct{}{}
@@ -202,7 +260,11 @@ func (p *PoolManager) processWriteQueue() bool {
 		stripeIds = append(stripeIds, id)
 	}
 
-	// 加载 stripes → pools → disks
+	// ---------------------------------------------------------------
+	// Step 4: 加载 stripe → pool → disk 的完整元数据链。
+	//
+	// 4a. 加载 stripe 列表，建立 stripeId → poolId 映射
+	// ---------------------------------------------------------------
 	var stripes []db.Stripe
 	if err := p.DbManager.DB.Where("id IN ?", stripeIds).Find(&stripes).Error; err != nil {
 		log.Printf("parity: query stripes failed: %v", err)
@@ -219,6 +281,7 @@ func (p *PoolManager) processWriteQueue() bool {
 		poolIds = append(poolIds, id)
 	}
 
+	// 4b. 加载 pool 配置（DataShards / ParityShards）
 	var pools []db.Pool
 	if err := p.DbManager.DB.Where("id IN ?", poolIds).Find(&pools).Error; err != nil {
 		log.Printf("parity: query pools failed: %v", err)
@@ -229,6 +292,7 @@ func (p *PoolManager) processWriteQueue() bool {
 		poolConfig[pl.Id] = struct{ DataShards, ParityShards int64 }{pl.DataShards, pl.ParityShards}
 	}
 
+	// 4c. 加载所有涉及的磁盘信息，建立 diskId → Disk 映射
 	var disks []db.Disk
 	if err := p.DbManager.DB.Where("pool_id IN ?", poolIds).Find(&disks).Error; err != nil {
 		log.Printf("parity: query disks failed: %v", err)
@@ -239,38 +303,45 @@ func (p *PoolManager) processWriteQueue() bool {
 		diskById[disks[i].Id] = disks[i]
 	}
 
-	// ── 一次性加载所有 stripe 的 chunk 元数据 ──
+	// 4d. 一次性加载所有 stripe 的全部 chunk 元数据
 	var allChunks []db.Chunk
 	if err := p.DbManager.DB.Where("stripe_id IN ?", stripeIds).Find(&allChunks).Error; err != nil {
 		log.Printf("parity: query chunks failed: %v", err)
 		return false
 	}
 
+	// ---------------------------------------------------------------
+	// Step 5: 按 stripe 组织 chunk 数据。
+	// 每个 stripeJob 包含 dataChunks(待编码的 data chunk) 和
+	// parityByIndex(parity chunk 按 index 索引)。
+	// ---------------------------------------------------------------
 	type stripeJob struct {
 		dataChunks    []db.Chunk
 		parityByIndex map[int64]db.Chunk
-		skip          bool
-		ds, ps        int
+		skip          bool            // 标记该 stripe 是否应跳过
+		ds, ps        int             // data shards / parity shards 数量
 	}
 	jobs := make(map[int64]*stripeJob, len(stripeIds))
 
-	// 按 stripe 组织
 	for _, c := range allChunks {
 		j, ok := jobs[c.StripeId]
 		if !ok {
+			// 首次遇到该 stripe，创建 job 并从 poolConfig 读取 RS 参数
 			pid := poolMap[c.StripeId]
 			cfg := poolConfig[pid]
 			j = &stripeJob{ds: int(cfg.DataShards), ps: int(cfg.ParityShards)}
 			jobs[c.StripeId] = j
 		}
+		// 按 chunk 类型分别收集
 		if c.Type == db.DataChunk {
+			// data chunk 处于 Pending 或 Error 状态时，跳过整个 stripe
 			if c.Status == db.ChunkPending || c.Status == db.ChunkError {
 				log.Printf("parity: stripe %d data index %d status=%d, skip", c.StripeId, c.Index, c.Status)
 				j.skip = true
 				continue
 			}
+			// 排除预留的但未写入的 slot
 			if c.Status != db.ChunkReserved {
-				// collect ordered by index later
 				j.dataChunks = append(j.dataChunks, c)
 			}
 		} else if c.Type == db.ParityChunk {
@@ -280,7 +351,8 @@ func (p *PoolManager) processWriteQueue() bool {
 			j.parityByIndex[c.Index] = c
 		}
 	}
-	// 排序 data chunks by Index（用 map O(n)）
+
+	// 对每个 stripe 的 data chunks 按 Index 排序（确保 RS 编码的顺序正确）
 	for _, j := range jobs {
 		if j.skip {
 			continue
@@ -298,7 +370,13 @@ func (p *PoolManager) processWriteQueue() bool {
 		j.dataChunks = ordered
 	}
 
-	// ── Phase 1: 统一锁所有 parity chunk，标记 Pending ──
+	// ---------------------------------------------------------------
+	// Phase 1: 统一锁住所有待处理 stripe 的 parity chunk，标记为 Pending。
+	//
+	// 为什么锁全部而非逐条：
+	//   - 防止两个批次同时处理同一个 stripe 的 parity
+	//   - 如果某个 stripe 的 parity 已经是 Pending（来自上一批），跳过整个 stripe
+	// ---------------------------------------------------------------
 	err = p.DbManager.DB.Transaction(func(tx *gorm.DB) error {
 		var allParity []db.Chunk
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
@@ -306,20 +384,21 @@ func (p *PoolManager) processWriteQueue() bool {
 			Find(&allParity).Error; err != nil {
 			return fmt.Errorf("lock parity: %w", err)
 		}
-		// 按 stripe 分组检查 Pending
+		// 检查哪些 stripe 的 parity 已经是 Pending 状态
 		pendingStripes := make(map[int64]bool)
 		for _, c := range allParity {
 			if c.Status == db.ChunkPending {
 				pendingStripes[c.StripeId] = true
 			}
 		}
+		// 标记这些 stripe 为跳过
 		for sid := range pendingStripes {
 			if j, ok := jobs[sid]; ok {
 				j.skip = true
 				log.Printf("parity: stripe %d parity pending, skip", sid)
 			}
 		}
-		// 收集非 skip stripe 的 parity ids
+		// 收集非跳过 stripe 的 parity id，统一更新为 Pending
 		var toUpdate []int64
 		for _, c := range allParity {
 			if j, ok := jobs[c.StripeId]; ok && !j.skip {
@@ -336,7 +415,10 @@ func (p *PoolManager) processWriteQueue() bool {
 		return false
 	}
 
-	// ── 并发计算 RS parity（无 DB 操作）──
+	// ---------------------------------------------------------------
+	// 并发计算 RS parity：对每个待处理的 stripe 启动一个 goroutine，
+	// 最多同时运行 4 个（信号量控制），防止内存被大量 stripe 撑爆。
+	// ---------------------------------------------------------------
 	type jobResult struct {
 		stripeId int64
 		ok       bool
@@ -344,7 +426,7 @@ func (p *PoolManager) processWriteQueue() bool {
 	}
 	resultCh := make(chan jobResult, len(jobs))
 	var computeWg sync.WaitGroup
-	sem := make(chan struct{}, 4)
+	sem := make(chan struct{}, 4) // 并发上限 4
 
 	for _, sid := range stripeIds {
 		j, ok := jobs[sid]
@@ -354,8 +436,8 @@ func (p *PoolManager) processWriteQueue() bool {
 		computeWg.Add(1)
 		go func(sid int64, j *stripeJob) {
 			defer computeWg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
+			sem <- struct{}{}       // 获取信号量
+			defer func() { <-sem }() // 释放信号量
 			res, ok := p.computeStripe(sid, j.ds, j.ps, j.dataChunks, j.parityByIndex, diskById)
 			resultCh <- jobResult{stripeId: sid, ok: ok, results: res}
 		}(sid, j)
@@ -363,7 +445,11 @@ func (p *PoolManager) processWriteQueue() bool {
 	computeWg.Wait()
 	close(resultCh)
 
-	// 收集计算结果
+	// ---------------------------------------------------------------
+	// 收集计算结果：
+	//   - allDataIds: 成功计算 parity 的 data chunk ID 列表
+	//   - allParityUpdates: parity chunk 的 ID / 大小 / 哈希
+	// ---------------------------------------------------------------
 	type parityUpdate struct {
 		id   int64
 		size int64
@@ -374,6 +460,7 @@ func (p *PoolManager) processWriteQueue() bool {
 
 	for r := range resultCh {
 		if !r.ok {
+			// 计算失败的 stripe 标记为跳过，不更新元数据
 			if j, ok := jobs[r.stripeId]; ok {
 				j.skip = true
 			}
@@ -391,21 +478,28 @@ func (p *PoolManager) processWriteQueue() bool {
 		}
 	}
 
-	// ── Phase 2: 批量更新 DB + 标记 QueueDone（同一事务）──
+	// ---------------------------------------------------------------
+	// Phase 2: 在一个事务中批量更新数据库。
+	//
+	// 更新项：
+	//   - data chunk 状态 → Active（parity 已就绪）
+	//   - parity chunk 状态 → Active，并更新 size 和 checksum
+	//   - 删除已处理的 WriteQueue 条目
+	// ---------------------------------------------------------------
 	allParityIds := make([]int64, len(allParityUpdates))
 	for i, pu := range allParityUpdates {
 		allParityIds[i] = pu.id
 	}
 
 	err = p.DbManager.DB.Transaction(func(tx *gorm.DB) error {
-		// data chunks → Active
+		// 将所有成功计算的 data chunk 标记为 Active
 		if len(allDataIds) > 0 {
 			if err := tx.Model(&db.Chunk{}).Where("id IN ?", allDataIds).
 				Update("status", db.ChunkActive).Error; err != nil {
 				return fmt.Errorf("update data: %w", err)
 			}
 		}
-		// parity chunks 一次性加载后 Save
+		// 加载 parity chunk 并更新大小和校验和
 		if len(allParityIds) > 0 {
 			var parity []db.Chunk
 			if err := tx.Where("id IN ?", allParityIds).Find(&parity).Error; err != nil {
@@ -425,7 +519,7 @@ func (p *PoolManager) processWriteQueue() bool {
 				return fmt.Errorf("save parity: %w", err)
 			}
 		}
-		// 标记 WriteQueue 完成
+		// 删除已处理完毕的 WriteQueue 条目
 		return tx.Where("status = ?", db.QueueProcessing).Delete(&db.WriteQueue{}).Error
 	})
 	if err != nil {
@@ -439,6 +533,12 @@ func (p *PoolManager) processWriteQueue() bool {
 }
 
 // StartParityWorker 启动后台 goroutine，按上下文退避轮询 DB 处理 parity。
+//
+// 轮询策略：
+//   - 初始间隔 1 秒
+//   - 每次有任务处理后重置为 1 秒
+//   - 连续空闲时退避到最大 5 秒（减少空轮询开销）
+//
 // ctx 取消时等待当前批次完成后退出 goroutine。
 func (p *PoolManager) StartParityWorker(ctx context.Context) {
 	go func() {
@@ -448,12 +548,16 @@ func (p *PoolManager) StartParityWorker(ctx context.Context) {
 		for {
 			select {
 			case <-ctx.Done():
+				// 收到退出信号，goroutine 立即返回
 				return
 			case <-ticker.C:
+				// 执行一次 parity 处理
 				hadWork := p.processWriteQueue()
 				if hadWork {
+					// 有任务处理，恢复为 1 秒间隔
 					interval = 1 * time.Second
 				} else {
+					// 空闲，指数退避到最大 5 秒
 					interval *= 2
 					if interval > 5*time.Second {
 						interval = 5 * time.Second

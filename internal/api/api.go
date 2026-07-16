@@ -1,3 +1,7 @@
+// Package api 提供 ZenoFS 的 HTTP REST API。
+//
+// 路由基于 chi 实现，所有端点以 /api 为前缀。
+// 请求和响应的 Content-Type 均为 application/json。
 package api
 
 import (
@@ -13,6 +17,7 @@ import (
 	"github.com/zzc53/zenofs/internal/pool"
 )
 
+// apiError 是统一的 JSON 错误响应结构。
 type apiError struct {
 	Code    int    `json:"code"`
 	StrCode string `json:"str_code"`
@@ -20,12 +25,15 @@ type apiError struct {
 	Value   string `json:"value,omitempty"`
 }
 
+// respondJSON 写 JSON 响应。
 func respondJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(v)
 }
 
+// respondErr 将 error 转为 JSON 错误响应。
+// ZenoError 映射为 400 + 结构化错误码，其他 error 映射为 500。
 func respondErr(w http.ResponseWriter, err error) {
 	if ze, ok := err.(*errs.ZenoError); ok {
 		respondJSON(w, http.StatusBadRequest, apiError{
@@ -37,6 +45,12 @@ func respondErr(w http.ResponseWriter, err error) {
 }
 
 // NewRouter 创建并返回配置好所有路由的 chi Router。
+//
+// 路由分组：
+//   - /api/pools — 存储池管理
+//   - /api/*/disks — 磁盘管理
+//   - /api/chunks — chunk 读写
+//   - /api/*/reconstruct — 故障重建
 func NewRouter(pm *pool.PoolManager) *chi.Mux {
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
@@ -44,6 +58,7 @@ func NewRouter(pm *pool.PoolManager) *chi.Mux {
 
 	r.Route("/api", func(r chi.Router) {
 		// ── Pool ──
+		// POST /api/pools  创建存储池（name + chunk_size_kb）
 		r.Post("/pools", func(w http.ResponseWriter, r *http.Request) {
 			var body struct {
 				Name      string `json:"name"`
@@ -61,6 +76,7 @@ func NewRouter(pm *pool.PoolManager) *chi.Mux {
 			respondJSON(w, http.StatusCreated, p)
 		})
 
+		// GET /api/pools/{id}  查询存储池信息
 		r.Get("/pools/{id}", func(w http.ResponseWriter, r *http.Request) {
 			id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
 			p, err := pm.GetPool(id)
@@ -71,6 +87,7 @@ func NewRouter(pm *pool.PoolManager) *chi.Mux {
 			respondJSON(w, http.StatusOK, p)
 		})
 
+		// PUT /api/pools/{id}/offline  将存储池标记为离线
 		r.Put("/pools/{id}/offline", func(w http.ResponseWriter, r *http.Request) {
 			id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
 			if err := pm.OfflinePool(id); err != nil {
@@ -81,6 +98,7 @@ func NewRouter(pm *pool.PoolManager) *chi.Mux {
 		})
 
 		// ── Disk ──
+		// POST /api/pools/{poolId}/disks  向存储池添加磁盘
 		r.Post("/pools/{poolId}/disks", func(w http.ResponseWriter, r *http.Request) {
 			poolId, _ := strconv.ParseInt(chi.URLParam(r, "poolId"), 10, 64)
 			var body struct {
@@ -99,6 +117,7 @@ func NewRouter(pm *pool.PoolManager) *chi.Mux {
 			respondJSON(w, http.StatusCreated, d)
 		})
 
+		// PUT /api/disks/{diskId}/swap  替换故障磁盘路径
 		r.Put("/disks/{diskId}/swap", func(w http.ResponseWriter, r *http.Request) {
 			diskId, _ := strconv.ParseInt(chi.URLParam(r, "diskId"), 10, 64)
 			var body struct {
@@ -116,6 +135,7 @@ func NewRouter(pm *pool.PoolManager) *chi.Mux {
 		})
 
 		// ── Chunk ──
+		// POST /api/pools/{poolId}/chunks  上传数据到存储池
 		r.Post("/pools/{poolId}/chunks", func(w http.ResponseWriter, r *http.Request) {
 			poolId, _ := strconv.ParseInt(chi.URLParam(r, "poolId"), 10, 64)
 			data, err := io.ReadAll(r.Body)
@@ -131,6 +151,7 @@ func NewRouter(pm *pool.PoolManager) *chi.Mux {
 			respondJSON(w, http.StatusCreated, c)
 		})
 
+		// GET /api/chunks/{id}  完整读取一个 chunk
 		r.Get("/chunks/{id}", func(w http.ResponseWriter, r *http.Request) {
 			id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
 			poolId, err := chunkPoolID(pm, id)
@@ -146,6 +167,7 @@ func NewRouter(pm *pool.PoolManager) *chi.Mux {
 			w.Write(data[0])
 		})
 
+		// PUT /api/chunks/{id}  完整覆写一个 chunk
 		r.Put("/chunks/{id}", func(w http.ResponseWriter, r *http.Request) {
 			id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
 			data, err := io.ReadAll(r.Body)
@@ -162,6 +184,7 @@ func NewRouter(pm *pool.PoolManager) *chi.Mux {
 		})
 
 		// ── Chunk Partial Read/Write ──
+		// GET /api/chunks/{id}/range?offset=N&length=M  部分读取
 		r.Get("/chunks/{id}/range", func(w http.ResponseWriter, r *http.Request) {
 			id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
 			offset, _ := strconv.ParseInt(r.URL.Query().Get("offset"), 10, 64)
@@ -178,6 +201,7 @@ func NewRouter(pm *pool.PoolManager) *chi.Mux {
 			w.Write(data)
 		})
 
+		// PUT /api/chunks/{id}/range?offset=N  部分覆写
 		r.Put("/chunks/{id}/range", func(w http.ResponseWriter, r *http.Request) {
 			id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
 			offset, _ := strconv.ParseInt(r.URL.Query().Get("offset"), 10, 64)
@@ -194,6 +218,7 @@ func NewRouter(pm *pool.PoolManager) *chi.Mux {
 		})
 
 		// ── Repair ──
+		// POST /api/pools/{poolId}/reconstruct  异步触发 stripe 重建
 		r.Post("/pools/{poolId}/reconstruct", func(w http.ResponseWriter, r *http.Request) {
 			poolId, _ := strconv.ParseInt(chi.URLParam(r, "poolId"), 10, 64)
 			go pm.ReconstructStripes(poolId)

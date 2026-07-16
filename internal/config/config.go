@@ -26,7 +26,8 @@ func Default() *Config {
 	}
 }
 
-// LoadFromEnv 从环境变量加载配置，覆盖默认值。
+// LoadConfig 加载系统配置。
+// 优先级：命令行参数（第 1 个） > 环境变量 ZENOFS_DSN > 默认值 sqlite://zenofs.db
 func LoadConfig(args []string) *Config {
 	cfg := Default()
 	if len(args) > 1 && args[1] != "" {
