@@ -52,7 +52,8 @@ func (m *DbManager) Close() error {
 
 // AutoMigrate 自动迁移给定的模型。
 func (m *DbManager) AutoMigrate() error {
-	if err := m.DB.AutoMigrate(&Pool{}, &Disk{}, &Chunk{}, &Stripe{}, &WriteQueue{}, &ReadCache{}, &Setting{}, &Task{}); err != nil {
+	if err := m.DB.AutoMigrate(&Pool{}, &Disk{}, &Chunk{}, &Stripe{}, &WriteQueue{}, &ReadCache{}, &Setting{}, &Task{},
+		&User{}, &Share{}, &ShareUser{}, &Inode{}, &Version{}, &VersionChunk{}, &InodeHistory{}); err != nil {
 		return err
 	}
 	// 首次运行时写入默认配置
