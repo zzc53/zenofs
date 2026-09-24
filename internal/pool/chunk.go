@@ -59,8 +59,6 @@ func (p *PoolManager) AddChunk(poolId int64, bytes []byte) (*db.Chunk, error) {
 	return &chunks[0], nil
 }
 
-const maxChunkBytes = 64 * 1024 * 1024 // 64MB safety guard
-
 // AddChunks 批量写入 chunks，支持任意数量（1 ≤ N）。
 //
 // 分配策略（三个 Phase 在同一事务中执行）：
@@ -109,17 +107,19 @@ func (p *PoolManager) AddChunks(poolId int64, dataList [][]byte) ([]db.Chunk, er
 	// 预计算每个 chunk 的 BLAKE3 哈希和大小（在事务外计算）。
 	// 这样事务内部只需读写 DB，不占用大量内存。
 	// ---------------------------------------------------------------
-	type item struct {
-		data []byte
-		hash [32]byte
-		size int
+	type ChunkData struct {
+		db.Chunk
+		Data []byte
 	}
-	items := make([]item, N)
+	items := make([]ChunkData, N)
 	for i, data := range dataList {
-		items[i] = item{
-			data: data,
-			hash: blake3.Sum256(data),
-			size: len(data),
+		hash := blake3.Sum256(data)
+		items[i] = ChunkData{
+			Data: data,
+			Chunk: db.Chunk{
+				Hash: hash[:],
+				Size: int64(len(data)),
+			},
 		}
 	}
 
@@ -128,7 +128,7 @@ func (p *PoolManager) AddChunks(poolId int64, dataList [][]byte) ([]db.Chunk, er
 	// ---------------------------------------------------------------
 	maxSize := pool.ChunkSize * 1024
 	for _, it := range items {
-		if int64(it.size) > maxSize {
+		if int64(it.Size) > maxSize {
 			return nil, errs.New(errs.ECODE_CHUNK_SIZE_EXCEED, errs.ESTR_CHUNK_SIZE_EXCEED,
 				"chunk exceeds pool chunk size", strconv.FormatInt(maxSize, 10))
 		}
@@ -162,8 +162,7 @@ func (p *PoolManager) AddChunks(poolId int64, dataList [][]byte) ([]db.Chunk, er
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
 			Model(&db.Chunk{}).
 			Select("chunks.*").
-			Joins("JOIN stripes ON chunks.stripe_id = stripes.id").
-			Where("chunks.status = ? AND chunks.type = ? AND stripes.pool_id = ?", db.ChunkReserved, db.DataChunk, poolId).
+			Where("status = ? AND chunks.type = ? AND pool_id = ?", db.ChunkReserved, db.DataChunk, poolId).
 			Limit(N).
 			Find(&reserved).Error; err != nil {
 			return errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
@@ -232,13 +231,13 @@ func (p *PoolManager) AddChunks(poolId int64, dataList [][]byte) ([]db.Chunk, er
 					}
 					status := db.ChunkReserved
 					var size int64
-					var checksum []byte
+					var hash []byte
 					if i < batchSize {
 						// 本次 batch 中实际写入的 data chunk，直接填数据
 						status = db.ChunkAllocated
 						itemIdx := len(reserved) + globalNewIdx + i
-						size = int64(items[itemIdx].size)
-						checksum = items[itemIdx].hash[:]
+						size = int64(items[itemIdx].Size)
+						hash = items[itemIdx].Hash[:]
 					}
 					p, err := generateChunkPath()
 					if err != nil {
@@ -253,8 +252,9 @@ func (p *PoolManager) AddChunks(poolId int64, dataList [][]byte) ([]db.Chunk, er
 						Path:     p,
 						DiskId:   shuffled[i].Id,
 						StripeId: stripe.Id,
+						PoolId:   stripe.PoolId,
 						Size:     size,
-						Checksum: checksum,
+						Hash:     hash,
 						Type:     typ,
 						Index:    idx,
 					}
@@ -280,8 +280,8 @@ func (p *PoolManager) AddChunks(poolId int64, dataList [][]byte) ([]db.Chunk, er
 		// ---------------------------------------------------------------
 		for i := range reserved {
 			reserved[i].Status = db.ChunkAllocated
-			reserved[i].Size = int64(items[i].size)
-			reserved[i].Checksum = items[i].hash[:]
+			reserved[i].Size = int64(items[i].Size)
+			reserved[i].Hash = items[i].Hash[:]
 			if reserved[i].Path == "" {
 				p, err := generateChunkPath()
 				if err != nil {
@@ -327,7 +327,7 @@ func (p *PoolManager) AddChunks(poolId int64, dataList [][]byte) ([]db.Chunk, er
 			if err := h.Write(disk, relPath, data); err != nil {
 				resultCh <- writeResult{idx, errs.FromError(err, errs.ECODE_FILE_WRITE, errs.ESTR_FILE_WRITE)}
 			}
-		}(i, diskById[c.DiskId], c.Path, items[i].data)
+		}(i, diskById[c.DiskId], c.Path, items[i].Data)
 	}
 	wg.Wait()
 	close(resultCh)
@@ -526,7 +526,7 @@ func (p *PoolManager) WriteChunks(items []WriteChunkItem) ([]db.Chunk, error) {
 		for i := range ordered {
 			ordered[i].Status = db.ChunkAllocated
 			ordered[i].Size = int64(prep[i].size)
-			ordered[i].Checksum = prep[i].hash[:]
+			ordered[i].Hash = prep[i].hash[:]
 			if ordered[i].Path == "" {
 				p, err := generateChunkPath()
 				if err != nil {

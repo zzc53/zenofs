@@ -85,7 +85,7 @@ type Chunk struct {
 	Status    ChunkStatus `gorm:"index"`
 	Path      string      // 相对路径（在 Disk.Path 下的位置）
 	Size      int64       // 数据实际大小（字节）
-	Checksum  []byte      // BLAKE3 哈希，用于数据完整性校验
+	Hash      []byte      // BLAKE3 哈希，用于数据完整性校验
 	DiskId    int64       `gorm:"index"` // 所在磁盘
 	StripeId  int64       `gorm:"index"` // 所属条带
 	PoolId    int64       `gorm:"index"` // 所属存储池
@@ -254,7 +254,7 @@ type Version struct {
 	Id        int64  `gorm:"primaryKey;autoIncrement"`
 	InodeId   int64  `gorm:"uniqueIndex:idx_ver_inode_num,priority:1;not null"`
 	Size      int64  `gorm:"default:0"` // 文件总大小
-	Checksum  string // 文件级哈希（所有 chunk 拼接后）
+	Hash      string // 文件级哈希（所有 chunk 拼接后）
 	CreatedBy int64  `gorm:"index"` // 创建用户ID
 	CreatedAt int64  `gorm:"autoCreateTime"`
 }
@@ -266,7 +266,7 @@ type VersionChunk struct {
 	Idx         int64  `gorm:"primaryKey"`     // 切片序号
 	ChunkId     int64  `gorm:"index;not null"` // 对应的存储层 chunk
 	Size        int64  `gorm:"not null"`       // 切片大小
-	Checksum    []byte `gorm:"not null"`       // 切片级哈希
+	Hash        []byte `gorm:"not null"`       // 切片级哈希
 	Encryption  int8   `gorm:"default:0"`
 	Compression int8   `gorm:"default:0"`
 }

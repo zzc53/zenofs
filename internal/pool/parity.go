@@ -437,7 +437,7 @@ func (p *PoolManager) processStripeQueue() bool {
 	//
 	// 更新项：
 	//   - data chunk 状态 → Active（parity 已就绪）
-	//   - parity chunk 状态 → Active，并更新 size 和 checksum
+	//   - parity chunk 状态 → Active，并更新 size 和 hash
 	//   - 删除已处理的 WriteQueue 条目
 	// ---------------------------------------------------------------
 	allParityIds := make([]int64, len(allParityUpdates))
@@ -464,7 +464,7 @@ func (p *PoolManager) processStripeQueue() bool {
 				pu := puMap[parity[i].Id]
 				parity[i].Status = db.ChunkAllocated
 				parity[i].Size = pu.size
-				parity[i].Checksum = pu.hash
+				parity[i].Hash = pu.hash
 			}
 			if err := tx.Save(&parity).Error; err != nil {
 				return fmt.Errorf("save parity: %w", err)
