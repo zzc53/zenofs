@@ -200,7 +200,8 @@ func (f *fileHandle) dropSlice(idx int64) error {
 func (f *fileHandle) Truncate(size int64) error { return f.truncateTo(size) }
 
 // truncateTo 把文件调整到指定大小。
-// 缩小会丢弃尾部切片；扩大不写任何数据，中间自然形成稀疏空洞。
+// 缩小会丢弃尾部切片，并把截断点所在的切片裁到截断点（见 trimSlice）；
+// 扩大不写任何数据，中间自然形成稀疏空洞。
 func (f *fileHandle) truncateTo(size int64) error {
 	if !f.writable {
 		return ErrPermission
@@ -218,13 +219,15 @@ func (f *fileHandle) truncateTo(size int64) error {
 	if size < f.newVer.Size {
 		slice := f.fs.sliceSize()
 		lastKept := (size + slice - 1) / slice // 从这个 Idx 起整片丢弃
-		if f.hasActive && f.activeIdx >= lastKept {
+		intra := size % slice                  // 截断点在边界切片内的位置；0 表示正好落在切片边界
+
+		// 活动切片：整个落在截断点之后就丢掉，跨过截断点就只留前半段。
+		// intra == 0 时活动切片正好是被完整保留的那一片，不能动。
+		switch {
+		case f.hasActive && f.activeIdx >= lastKept:
 			f.hasActive, f.activeBuf = false, nil
-		} else if f.hasActive {
-			// 活动切片跨越截断点：只保留前半段
-			if cut := size % slice; cut < int64(len(f.activeBuf)) {
-				f.activeBuf = f.activeBuf[:cut]
-			}
+		case f.hasActive && intra != 0 && f.activeIdx == size/slice && intra < int64(len(f.activeBuf)):
+			f.activeBuf = f.activeBuf[:intra]
 		}
 		for idx := range f.newChunks {
 			if idx >= lastKept {
@@ -236,11 +239,41 @@ func (f *fileHandle) truncateTo(size int64) error {
 			Delete(&db.VersionChunk{}).Error); err != nil {
 			return err
 		}
+		// 截断点落在切片内部：已落盘的边界切片也要裁掉尾部，
+		// 否则以后再把文件扩大会把被截掉的数据读回来（POSIX 要求新区域读作零）。
+		if intra != 0 {
+			if err := f.trimSlice(size/slice, intra); err != nil {
+				return err
+			}
+		}
 	}
 
 	f.newVer.Size = size
 	f.dirty = true
 	return nil
+}
+
+// trimSlice 把某个切片的明文裁到 size 字节并重新落盘（生成新的 chunk）。
+//
+// 只在截断点落在切片内部时调用：被截掉的那半段必须真的从存储层消失，
+// 否则后来扩大文件会把旧数据读回来。
+func (f *fileHandle) trimSlice(idx, size int64) error {
+	if f.hasActive && f.activeIdx == idx {
+		// 活动缓冲是这份内容的唯一副本，直接在内存里截断即可
+		if int64(len(f.activeBuf)) > size {
+			f.activeBuf = f.activeBuf[:size]
+		}
+		return nil
+	}
+	buf, err := f.slicePlain(idx)
+	if err != nil {
+		return err
+	}
+	if buf == nil || int64(len(buf)) <= size {
+		return nil // 空洞，或本来就短于截断点（不含被截掉的数据）
+	}
+	// 拷一份再落盘：putSlice 之后 buf 仍可能被这个句柄复用
+	return f.putSlice(idx, append([]byte(nil), buf[:size]...))
 }
 
 // ---------------------------------------------------------------

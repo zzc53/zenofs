@@ -15,9 +15,12 @@
 //   - 路径是 '/' 分隔的绝对路径，'/' 表示挂载根。各协议的分隔符差异
 //     （SMB 的 '\'、WebDAV 的 URL 转义）由协议层转换，VFS 一律按 POSIX 语义处理，
 //     区分大小写，不做路径规范化之外的任何转换。
-//   - 一个 FileSystem 实例绑定"一个已认证用户 + 一个挂载的 Share"，
-//     所以方法不接收用户参数。ctx 只用于取消与超时。
-//     多挂载点（一个用户能看到多个 Share）由上层聚合，不属于本接口。
+//   - 一个 FileSystem 实例绑定"一个已认证用户 + 一个挂载点"，所以方法不接收用户参数；
+//     ctx 只用于取消与超时。实现有两种：ShareFS 挂"一个 Share"（路径就是 Share 内的路径），
+//     RootFS（root.go）把该用户可见的所有 Share 挂到同一个根下，
+//     路径形如 "/<share>/..."，根目录就是 Share 列表。
+//   - 只有一个挂载点的协议（SMB 会话、WebDAV 的某个集合）直接用 ShareFS；
+//     需要"先看到有哪些 Share"的协议（SFTP 的 HOME、WebDAV 的根集合）用 RootFS。
 //   - 错误是 POSIX 语义的哨兵值，调用方用 errors.Is 判定后映射成各自的错误码
 //     （SFTP status code / HTTP 状态码 / SMB NTSTATUS），见文件末尾的错误表。
 //   - 只读还是读写由 SharePermission 决定：只读挂载上的写操作返回 ErrPermission。
@@ -37,10 +40,11 @@ package vfs
 
 import (
 	"context"
-	"errors"
 	"io"
 	"os"
 	"time"
+
+	"github.com/zzc53/zenofs/internal/errs"
 )
 
 // ─────────────────────────────────────────────────────────────
@@ -155,7 +159,10 @@ type FileMode = os.FileMode
 // FileInfo 是一个路径或句柄的元数据。
 // 只覆盖三协议共同需要的属性；实现缺少的字段（如 Uid/Gid）可以按约定合成。
 type FileInfo struct {
-	Id   int64  // inode 编号：SMB 用作 FileId，WebDAV 可参与合成 ETag
+	// Id 是挂载点内的条目编号（SMB 用作 FileId，WebDAV 可参与合成 ETag）。
+	// ShareFS 用 inodes.id（合成的挂载根为 0）；RootFS 根下的 Share 目录
+	// 用 -shares.id，保证同一个挂载点内编号唯一。
+	Id   int64
 	Name string // 路径最后一段；挂载根为 "/"
 	Path string // 规范化后的绝对路径
 	Kind Kind   // 文件 / 目录 / 符号链接
@@ -256,24 +263,30 @@ type LockToken string
 //	ErrIsDir       → SSH_FX_FILE_IS_A_DIRECTORY / 405 / STATUS_FILE_IS_A_DIRECTORY
 //	ErrNoSpace     → SSH_FX_FAILURE / 507 / STATUS_DISK_FULL
 //	ErrNotSupported → SSH_FX_OP_UNSUPPORTED / 501 / STATUS_NOT_SUPPORTED
+//
+// 它们同时是标准化错误（*errs.ZenoError，带 Code / StrCode，见 errs.ECODE_VFS_*），
+// 所以协议层有两条路可选：用 errors.Is 判定后映射成协议错误码，
+// 或者直接把 Code / StrCode 透给客户端（internal/api 的 respondErr 就是这么处理 ZenoError 的）。
 var (
-	ErrNotExist     = errors.New("vfs: no such file or directory")
-	ErrExist        = errors.New("vfs: file exists")
-	ErrPermission   = errors.New("vfs: permission denied")
-	ErrNotEmpty     = errors.New("vfs: directory not empty")
-	ErrIsDir        = errors.New("vfs: is a directory")
-	ErrNotDir       = errors.New("vfs: not a directory")
-	ErrReadOnly     = errors.New("vfs: read-only filesystem")
-	ErrNoSpace      = errors.New("vfs: no space left on device")
-	ErrInvalid      = errors.New("vfs: invalid argument")
-	ErrNotSupported = errors.New("vfs: operation not supported")
-	ErrBusy         = errors.New("vfs: resource busy")
-	ErrNameTooLong  = errors.New("vfs: file name too long")
-	ErrLoop         = errors.New("vfs: too many levels of symbolic links")
+	ErrNotExist     = errs.New(errs.ECODE_VFS_NOT_FOUND, errs.ESTR_VFS_NOT_FOUND, "vfs: no such file or directory", "")
+	ErrExist        = errs.New(errs.ECODE_VFS_EXIST, errs.ESTR_VFS_EXIST, "vfs: file exists", "")
+	ErrPermission   = errs.New(errs.ECODE_VFS_PERMISSION, errs.ESTR_VFS_PERMISSION, "vfs: permission denied", "")
+	ErrNotEmpty     = errs.New(errs.ECODE_VFS_NOT_EMPTY, errs.ESTR_VFS_NOT_EMPTY, "vfs: directory not empty", "")
+	ErrIsDir        = errs.New(errs.ECODE_VFS_IS_DIR, errs.ESTR_VFS_IS_DIR, "vfs: is a directory", "")
+	ErrNotDir       = errs.New(errs.ECODE_VFS_NOT_DIR, errs.ESTR_VFS_NOT_DIR, "vfs: not a directory", "")
+	ErrReadOnly     = errs.New(errs.ECODE_VFS_READ_ONLY, errs.ESTR_VFS_READ_ONLY, "vfs: read-only filesystem", "")
+	ErrNoSpace      = errs.New(errs.ECODE_VFS_NO_SPACE, errs.ESTR_VFS_NO_SPACE, "vfs: no space left on device", "")
+	ErrInvalid      = errs.New(errs.ECODE_VFS_INVALID, errs.ESTR_VFS_INVALID, "vfs: invalid argument", "")
+	ErrNotSupported = errs.New(errs.ECODE_VFS_NOT_SUPPORTED, errs.ESTR_VFS_NOT_SUPPORTED, "vfs: operation not supported", "")
+	ErrBusy         = errs.New(errs.ECODE_VFS_BUSY, errs.ESTR_VFS_BUSY, "vfs: resource busy", "")
+	ErrNameTooLong  = errs.New(errs.ECODE_VFS_NAME_TOO_LONG, errs.ESTR_VFS_NAME_TOO_LONG, "vfs: file name too long", "")
+	ErrLoop         = errs.New(errs.ECODE_VFS_LOOP, errs.ESTR_VFS_LOOP, "vfs: too many levels of symbolic links", "")
 	// ErrCrossDevice 表示操作跨越了挂载点（跨 Share 的 Rename/Copy）。
 	// 对应 POSIX 的 EXDEV、SFTP 的 SSH_FX_OP_UNSUPPORTED、SMB 的 STATUS_NOT_SAME_DEVICE。
-	ErrCrossDevice = errors.New("vfs: cross-device link")
-	// ErrLocked 表示 Share 启用了加密、但当前会话尚未用口令解锁。
+	ErrCrossDevice = errs.New(errs.ECODE_VFS_CROSS_DEVICE, errs.ESTR_VFS_CROSS_DEVICE, "vfs: cross-device link", "")
+	// ErrEncrypted 表示这个 Share 启用了加密，而当前会话里没有可用密钥
+	// （没调用过 UsePassword，或者 ClearKey 清掉了）——描述的是 Share 的加密属性，
+	// 与 Locker 的"锁被占用"（ErrBusy）是两回事。
 	// 对应 SFTP 的 SSH_FX_PERMISSION_DENIED、HTTP 403、SMB 的 STATUS_ACCESS_DENIED。
-	ErrLocked = errors.New("vfs: share is locked")
+	ErrEncrypted = errs.New(errs.ECODE_VFS_ENCRYPTED, errs.ESTR_VFS_ENCRYPTED, "vfs: share is encrypted", "")
 )

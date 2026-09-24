@@ -97,7 +97,7 @@ func (fs *ShareFS) SetPassword(password string) error {
 		return ErrInvalid // 该 Share 没有启用加密
 	}
 	if len(fs.share.EncryptionKeyHash) != 0 {
-		return ErrExist // 已经设置过口令，改用 Unlock
+		return ErrExist // 已经设置过口令，改用 UsePassword
 	}
 
 	salt := make([]byte, saltLen)
@@ -118,9 +118,9 @@ func (fs *ShareFS) SetPassword(password string) error {
 	return nil
 }
 
-// Unlock 用口令派生密钥并解锁该 Share；口令不对返回 ErrPermission。
-// 未启用加密的 Share 无需解锁，直接成功。
-func (fs *ShareFS) Unlock(password string) error {
+// UsePassword 用口令派生密钥并打开该 Share 的加密；口令不对返回 ErrPermission。
+// 未启用加密的 Share 无需提供口令，直接成功。
+func (fs *ShareFS) UsePassword(password string) error {
 	if fs.share.Encryption == EncryptionNone {
 		return nil
 	}
@@ -137,16 +137,16 @@ func (fs *ShareFS) Unlock(password string) error {
 	return nil
 }
 
-// Lock 清除会话里的密钥。
-func (fs *ShareFS) Lock() {
+// ClearKey 清除会话里的密钥。
+func (fs *ShareFS) ClearKey() {
 	for i := range fs.key {
 		fs.key[i] = 0
 	}
 	fs.key = nil
 }
 
-// Unlocked 报告当前会话是否已持有可用密钥。
-func (fs *ShareFS) Unlocked() bool {
+// HasKey 报告当前会话是否已持有可用密钥。
+func (fs *ShareFS) HasKey() bool {
 	return len(fs.key) == keyLen
 }
 
@@ -157,8 +157,8 @@ func deriveKey(password string, salt []byte) []byte {
 
 // aead 返回绑定当前会话密钥的 AES-256-GCM。
 func (fs *ShareFS) aead() (cipher.AEAD, error) {
-	if !fs.Unlocked() {
-		return nil, ErrLocked
+	if !fs.HasKey() {
+		return nil, ErrEncrypted
 	}
 	block, err := aes.NewCipher(fs.key)
 	if err != nil {
@@ -199,7 +199,7 @@ func (fs *ShareFS) decodeSlice(stored []byte, comp, enc int8) ([]byte, error) {
 }
 
 // requireCodec 检查写路径所需的编解码条件：
-// 算法要认识，启用加密时要处于已解锁状态。
+// 算法要认识，启用加密时要已持有密钥。
 func (fs *ShareFS) requireCodec() error {
 	switch fs.share.Compression {
 	case CompressionNone, CompressionZstd:
@@ -209,8 +209,8 @@ func (fs *ShareFS) requireCodec() error {
 	switch fs.share.Encryption {
 	case EncryptionNone:
 	case EncryptionAESGCM:
-		if !fs.Unlocked() {
-			return ErrLocked
+		if !fs.HasKey() {
+			return ErrEncrypted
 		}
 	default:
 		return ErrNotSupported

@@ -1,16 +1,21 @@
 # zenofs
 
-ZenoFS —— 基于 Reed-Solomon 纠删码的存储系统。
+ZenoFS —— 基于 Reed-Solomon 纠删码的 NAS：客户端通过 **SMB / WebDAV / SFTP** 接入。
 
 ## 项目简介
 
-写入的数据被切成 N 个 data chunk，用 RS 编码算出 M 个 parity chunk，打散落到池内不同磁盘上；
-任意丢失不超过 M 个分片都能重建。对外通过 HTTP REST API 提供存储池管理、分片读写。
+ZenoFS 是一个自托管网络存储（NAS）：客户端用 SMB（Windows/macOS 共享）、WebDAV 或 SFTP 挂载，
+看到的是"用户 → Share → 目录/文件"这棵树；三种协议的服务端共用同一套 `internal/vfs`
+文件系统接口，差异（分隔符、转义、错误码）只在协议层抹平。
+
+存储层不直接对外提供文件访问：写入的数据被切成 N 个 data chunk，用 RS 编码算出 M 个 parity chunk，
+打散落到池内不同磁盘上，任意丢失不超过 M 个分片都能重建。另外提供一个 HTTP REST API，
+用于存储池 / 磁盘 / 分片这一层的管理——它不是面向最终用户的文件访问接口。
 
 当前状态：存储层（pool / disk / stripe / chunk / parity / cache）已可用；Share Layer 的模型
 （User / Share / Inode / Version）已在 `internal/db/models.go` 定义并建表；`internal/vfs` 提供
-供 SFTP / SMB / WebDAV 共用的文件系统接口与单 Share 实现。**尚缺**：压缩/加密、多 Share 聚合层，
-以及三个协议的服务端本身。
+SMB / WebDAV / SFTP 共用的文件系统接口、单 Share 实现（`ShareFS`）与多 Share 聚合层
+（`RootFS`）。**尚缺**：三个协议的服务端本身，以及用户认证与授权管理接口。
 
 ## 技术栈
 
@@ -23,7 +28,7 @@ ZenoFS —— 基于 Reed-Solomon 纠删码的存储系统。
 | 哈希 | `github.com/zeebo/blake3` |
 | 并发 | 标准库 `sync` + 项目内自建的 `parallelEach`（`internal/pool/parallel.go`） |
 
-依赖已提交到 `vendor/`，构建默认走 `-mod=vendor`；改动依赖后用 `go mod vendor` 重新同步。
+依赖放在本地的 `vendor/` 目录（构建默认走 `-mod=vendor`，该目录不入库）；改动依赖后用 `go mod vendor` 重新同步。
 
 ## 常用命令
 
@@ -31,6 +36,7 @@ ZenoFS —— 基于 Reed-Solomon 纠删码的存储系统。
 go build ./...                        # 构建
 go vet ./...                          # 静态检查
 gofmt -l ./cmd ./internal             # 格式检查
+go test ./...                         # 单元测试（见"测试"一节）
 
 go run ./cmd/zenofs                   # 默认 sqlite://zenofs.db
 go run ./cmd/zenofs "postgres://..."  # 也可用 ZENOFS_DSN 环境变量
@@ -38,6 +44,35 @@ go run ./cmd/zenofs "postgres://..."  # 也可用 ZENOFS_DSN 环境变量
 
 DSN 前缀决定驱动（`sqlite://` / `mysql://` / `postgres://`）。HTTP 端口取自 `settings` 表的
 `HTTP_PORT`（默认 8080）。
+
+## 测试
+
+```bash
+go test ./...                            # 全部包
+go test -race ./...                      # 竞态检测（并发读写池/文件系统的路径值得跑一遍）
+go test -cover ./...                     # 覆盖率
+go test ./internal/vfs -run TestRoot -v  # 单包 / 单组用例
+```
+
+测试一律打真实实现：每个用例用 `t.TempDir()` 里的临时 SQLite 库 + 临时磁盘目录，
+SQLite 库通过 `internal/testutil` 建好并 `AutoMigrate`，不起任何 mock。
+因此 **测试需要 CGO**（`mattn/go-sqlite3` 是 cgo 驱动）：交叉编译或用 `CGO_ENABLED=0` 的环境跑不了。
+随机数据由 `testutil.RandBytes(seed, n)` 生成，固定 seed 可复现。
+
+| 包 | 覆盖内容 | 覆盖率 |
+|---|---|---|
+| `internal/hash` | 摘要定长/确定性、`SumArray` 与 `Sum` 一致、`Equal` 的"没有期望值就不校验"语义 | 100% |
+| `internal/errs` | 数值码与字符串码唯一、`Error()` 文案、`errors.As` 取出 `*ZenoError`、`Unwrap` 让 `errors.Is` 穿透包装 | 100% |
+| `internal/config` | 配置优先级 argv > `ZENOFS_DSN` > 默认值 | 100% |
+| `internal/db` | DSN 分支、`AutoMigrate` 建表/幂等/默认配置、`GetSetting` | 93% |
+| `internal/pool` | 池/盘参数校验、chunk 写入-读取-覆写、预留槽位复用、write queue → stripe queue 搬运、RS parity 编码（与 `reedsolomon` 独立复算比对）、坏块重建与换盘恢复、读缓存落盘与冷却淘汰、`parallelEach` 并发上限 | 77% |
+| `internal/vfs` | 路径规范化与 `checkName`、zstd 往返与压缩效果、AES-GCM 加解密与篡改检测、口令生命周期、ShareFS 命名空间/权限/配额/稀疏/版本提交/快照隔离、切片级写时复制、Truncate 的截断裁剪与对齐边界、`RootFS` 根聚合（可见性、只读视图、跨 Share、密钥保留）、**错误码标准化**（每个哨兵都带 `Code`/`StrCode`，并从真实操作取码校验） | 82% |
+| `internal/api` | 真实 chi 路由 + `httptest`：建池/查池/下线/加盘/换盘/重建/chunk 上传-下载-覆写，以及各类 400 | 80% |
+
+**不测**：`cmd/zenofs`（进程装配）与后台 worker 的定时/异步时序
+（`StartParityWorker`、`StartCacheCleaner` 的 ticker 循环、并行调度的等待逻辑）——这类用例要等时钟、
+容易 flaky。它们背后的同步内核（`calculateStripeParity`、`rebuildStripe`、`cleanupColdCache`、
+`Flush`）都由上面的用例直接驱动，逻辑本身是覆盖到的。
 
 ## 目录结构
 
@@ -49,7 +84,9 @@ internal/db/       GORM 连接与全部数据模型
 internal/errs/     统一错误码与 ZenoError
 internal/hash/     摘要算法收口（BLAKE3-256；分片/校验分片/口令校验值都用它）
 internal/pool/     核心：存储池 / 磁盘 / chunk / parity / 读缓存
-internal/vfs/      文件系统层（SFTP / SMB / WebDAV 共用）：接口定义 + 基于 Share/Inode/Version 的实现
+internal/testutil/ 测试脚手架：临时 SQLite 库 + 本地盘存储池 + Share 行（只被 _test.go 引用）
+internal/vfs/      文件系统层（SMB / WebDAV / SFTP 共用）：接口定义 + 基于 Share/Inode/Version 的实现
+                   （ShareFS = 单 Share，RootFS = 把用户可见的多个 Share 挂在同一个根下）
 ```
 
 ## 数据库设计
@@ -74,12 +111,13 @@ internal/vfs/      文件系统层（SFTP / SMB / WebDAV 共用）：接口定�
 | `settings` | 全局 KV | `name`(唯一) `value` |
 | `tasks` | 后台作业（一次重建 = 一条） | `name`(形如 `rebuild-pool:<poolId>`) `status` `message` `metadata` |
 
-### Share Layer（模型 + 接口，尚无实现）
+### Share Layer
 
 `users` `shares` `share_users` `inodes` `versions` `version_chunks` `inode_histories`
 
-`internal/vfs` 定义了 SFTP / SMB / WebDAV 共用的 `FileSystem` / `File` 接口（只有接口，无实现）。
-VFS 属性到模型的对应关系：
+`internal/vfs` 定义了 SMB / WebDAV / SFTP 共用的 `FileSystem` / `File` 接口，并给出两个实现：
+`ShareFS`（一个实例挂一个 Share）与 `RootFS`（把用户可见的多个 Share 挂在同一个根下，
+见下面"文件系统（vfs）"一节）。VFS 属性到模型的对应关系：
 
 | VFS 属性 | 来源 |
 |---|---|
@@ -197,6 +235,35 @@ VFS 属性到模型的对应关系：
 
 `internal/vfs` 把每个 Share 挂载成一个 `FileSystem`，一个实例绑定"一个用户 + 一个 Share"。
 
+#### 多 Share 聚合（`RootFS`）
+
+SMB / WebDAV / SFTP 这类协议有统一的根目录：客户端连上来要先回答"这个用户有哪些 Share"，
+`RootFS` 就是这一层：根下每个 Share 一个一级目录（目录名 = `shares.name`），
+路径第一段决定落到哪个 `ShareFS`，`/` 与 `/<share>` 是合成条目，其余部分原样转发。
+
+- **可见性**：只列 `share_users` 里有该用户记录的 Share，权限取该记录的 `permission`。
+  每次解析路径都重新确认授权，所以会话期间回收授权立刻生效；别人的 Share、
+  以及不能作为目录名的 `shares.name`（含 '/'、NUL 或超过 255 字节）都不会出现在根下
+  （后者记一条日志，因为它没有可寻址的路径）。
+- **只读视图**：根与挂载点根都不是真实的 inode，这两层上的写操作
+  （`Mkdir` / `Remove` / `Rename` / `SetAttr` / `Symlink` / 带 `Create` 的 `Open`）
+  一律返回 `ErrNotSupported`，跨 Share 的 `Rename` / `Copy` 返回 `ErrCrossDevice`。
+  Share 的增删改属于授权管理，不走文件系统接口。`Copy` 的目标必须不存在（沿用 `ShareFS` 语义）。
+- **条目编号**：根下 Share 目录的 `FileInfo.Id` 取 `-shares.id`。`shares` 与 `inodes`
+  两张表各自自增，取负数才能保证同一个挂载点内编号唯一（协议层可拿它当 FileId）。
+- **符号链接**：`Target` 与 `Readlink` 的返回值都带挂载点前缀（如 `/work/a/b`）；
+  链接只能指向同一个 Share 内已存在的路径（`ShareFS` 用 inode 引用表达链接），
+  跨 Share 或指向根的目标返回 `ErrNotSupported` / `ErrCrossDevice`。
+- **加密口令**：启用加密的 Share 在根目录里照旧可见（元数据不需要密钥），
+  但文件读写返回 `ErrEncrypted`，要用 `RootFS.UsePassword(name, password)` 提供口令；
+  密钥缓存在 `RootFS` 里，因此权限/配额等元数据变化触发挂载实例重建时不会丢密钥。
+- **配额**：`StatFS("/")` 只汇总该用户所有可见 Share 的已用量（根没有统一配额），
+  Share 内的路径转发给 `ShareFS`（上限来自该 Share 的 `quota`）。
+- 另外提供 `Share(name)`（取 Share 记录与权限）和 `Mount(name)`（直接拿某个 Share 的
+  `*ShareFS`），供协议层绕开路径解析使用。
+
+#### 单 Share（`ShareFS`）
+
 - **路径**：绝对路径、'/' 分隔、纯词法规范化；`ParentId IS NULL` 的 inode 就是 Share 根下的一级条目，
   根目录本身没有 inode 记录（用 Id 0 合成）。
 - **读**：以"句柄打开时的那个版本"为准（**快照语义**）。按 `VersionChunk.Idx` 懒加载切片，
@@ -209,6 +276,9 @@ VFS 属性到模型的对应关系：
 - **提交**：`Version.Size` 与 `Inode.VersionId` 在 Close 时一次性切换；打开后没写过任何字节
   则丢弃那个空版本。`SetAttr` 的 Size 走同一条 Truncate 路径。
 - **稀疏**：Truncate 扩大不写数据，中间留空洞；全零切片等价于空洞，不占存储。
+- **截断**：Truncate 缩小会丢弃截断点之后的整片，并把截断点所在的切片裁到截断点
+  （`trimSlice` 走一次切片级 read-modify-write）。被截掉的数据真的从存储层消失，
+  之后再扩大文件只会读到零——注意旧版本仍引用原 chunk，所以历史版本照旧可读。
 - **配额**：写路径按「该 Share 所有 inode 当前版本大小之和」判断，超限返回 `ErrNoSpace`。
 - **属性映射**：见上面的对照表；`SetAttr` 的 Uid/Gid 被忽略，Mode 只影响可执行位。
 
@@ -218,13 +288,14 @@ VFS 属性到模型的对应关系：
   默认档位 `SpeedDefault`，帧头只有十几字节，相对 MB 级切片可忽略）；
 - 加密：`Share.Encryption = 1` 用 AES-256-GCM，密文格式 `nonce(12B) || ciphertext+tag`，每片随机 nonce，
   GCM 自带认证——密文被篡改时解密直接失败，会触发该条带的重建；
-- 密钥：由用户口令经 **PBKDF2-HMAC-SHA256（600k 次迭代）**派生，**只存在于会话内存**（`ShareFS.Unlock`
-  解锁、`Lock` 清除）。落库的只有 `shares.encryption_key_hash`，布局是 `salt(16B) || blake3(密钥)(32B)`：
+- 密钥：由用户口令经 **PBKDF2-HMAC-SHA256（600k 次迭代）**派生，**只存在于会话内存**（`ShareFS.UsePassword`
+  提供口令、`ClearKey` 清除）。落库的只有 `shares.encryption_key_hash`，布局是 `salt(16B) || blake3(密钥)(32B)`：
   前者供派生使用，后者用来校验口令是否正确。首次启用加密用 `SetPassword` 生成 salt；
 - 算法记在 **`versions.compression` / `versions.encryption`** 上，因此以后改 Share 的算法不会让历史数据解不开；
   例外：`compression = 1` 曾经表示 DEFLATE，现已改为 Zstandard——老库里按 flate 写下的切片解不开
   （需要重写数据；本地开发库无此类数据）；
-- 加密的 Share 未解锁时，`Open` 直接返回 `ErrLocked`（`Stat`/`ReadDir` 等元数据操作不受影响）。
+- 加密的 Share 未提供口令时，`Open` 直接返回 `ErrEncrypted`（`Stat`/`ReadDir` 等元数据操作不受影响）。
+  这个错误说的是"该 Share 是加密的、当前会话没有密钥"，与 `Locker` 的"锁被占用"（`ErrBusy`）是两回事。
 
 > 尚未做：修改口令 / 密钥轮换、派生参数的版本化（迭代次数写死，将来调整需要兼容策略）。
 
@@ -250,6 +321,16 @@ func firstErr(errs []error) error
 
 - 错误一律用 `internal/errs` 的 `ZenoError`（数值 `Code` + 字符串 `StrCode` + `InnerErr`）；
   API 层把 `ZenoError` 映射为 400 + 结构化 JSON，其余 error 映射为 500。
+- `internal/vfs` 的 POSIX 哨兵错误（`ErrNotExist` / `ErrPermission` / `ErrCrossDevice` …）本身就是
+  `*errs.ZenoError`，码是 `errs.ECODE_VFS_*`：协议层既能 `errors.Is` 判定后映射成自己的错误码
+  （SFTP status / NTSTATUS），也能直接把 `Code` / `StrCode` 回给客户端。`ZenoError.Unwrap` 暴露
+  `InnerErr`，因此被 `fmt.Errorf("%w")` 包装后依然能 `errors.Is` / `errors.As` 穿透。
+  新增这类错误时必须同时给出数值码与字符串码——`errs_test.go` 会校验码不重复。
+- **命名约定（两件不同的事，别混用）**：
+  `Lock` / `Unlock` 专指"锁定文件"——WebDAV 的 LOCK、SMB 的字节范围锁，见 `Locker` 接口；
+  加密会话的状态用另一组词：`UsePassword`（用口令派生并持有密钥）、`ClearKey`（清除密钥）、
+  `HasKey`（当前是否持有密钥）。相应地，`ErrEncrypted` 说的是 Share 的加密属性（会话里没有密钥），
+  `ErrBusy` 才是锁被占用。
 - **DB 操作批量进行**：一次 `IN` 查询、一条 `UPDATE ... WHERE id IN (...)`、一次 upsert，
   不要写逐条往返的循环；一批操作尽量包在一个 `Transaction` 里。
 - 文件读写统一走 `ChunkHandler` 接口（`Write` / `Read` / `Delete`，见 `internal/pool/handler.go`），
@@ -259,17 +340,12 @@ func firstErr(errs []error) error
 
 ## 验证
 
-仓库当前没有测试文件。改动后至少跑：
+提交前至少跑一遍（细节见上面的"测试"一节）：
 
 ```bash
 go build ./... && go vet ./... && gofmt -l ./cmd ./internal
+go test ./... && go test -race ./...
 ```
 
-涉及并发（`parallelEach` / `computeStripe` / 缓存 / 队列）的改动，建议临时补一个 `-race` 冒烟测试，
-验证通过后**删除测试文件**，不要把临时测试留进仓库：
-
-```bash
-go test -race -count=1 ./internal/pool/
-```
-
-全仓 `gofmt -l` 保持干净。
+新增或修改功能时，在对应包的 `*_test.go` 里补用例，不要临时写脚本验证完再删：
+用例统一用 `internal/testutil` 建临时库与盘，跑完自动清理，仓库里不留任何临时文件。

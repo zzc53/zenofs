@@ -68,7 +68,7 @@ func (fs *ShareFS) Open(ctx context.Context, p string, flags OpenFlags, mode Fil
 			return nil, err
 		}
 	}
-	// 读写文件内容都需要编解码能力：算法要认识，启用加密时必须已解锁。
+	// 读写文件内容都需要编解码能力：算法要认识，启用加密时必须已提供口令。
 	// 元数据操作（Stat/ReadDir 等）不需要密钥，不受这里影响。
 	if err := fs.requireCodec(); err != nil {
 		return nil, err

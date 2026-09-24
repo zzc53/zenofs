@@ -37,13 +37,13 @@ type ShareFS struct {
 	userID int64
 	perm   db.SharePermission
 
-	// key 是解密该 Share 的密钥，仅在启用加密且用户已解锁时非空。
+	// key 是解密该 Share 的密钥，仅在启用加密且用户已提供口令时非空。
 	key []byte
 }
 
 var _ FileSystem = (*ShareFS)(nil)
 
-// NewShareFS 创建 Share 文件系统。加密的 Share 需要再调 Unlock 才能读写文件内容。
+// NewShareFS 创建 Share 文件系统。加密的 Share 需要再调 UsePassword 才能读写文件内容。
 func NewShareFS(pm *pool.PoolManager, share db.Share, userID int64, perm db.SharePermission) *ShareFS {
 	return &ShareFS{pm: pm, share: share, userID: userID, perm: perm}
 }

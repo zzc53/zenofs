@@ -24,6 +24,24 @@ const (
 	ECODE_CHUNK_EMPTY       = 12 // 写入空数据
 	ECODE_CHUNK_SIZE_EXCEED = 13 // chunk 数据超过大小限制
 	ECODE_CHUNK_NOT_FOUND   = 14 // chunk 不存在或不属于指定 pool
+
+	// vfs 的 POSIX 语义错误（internal/vfs 的 ErrNotExist 等哨兵用它）。
+	// 协议层（SFTP / SMB / WebDAV）可以按 Code 直接回各自的状态码，不必解析错误文本。
+	ECODE_VFS_NOT_FOUND     = 15 // 路径或条目不存在
+	ECODE_VFS_EXIST         = 16 // 目标已存在
+	ECODE_VFS_PERMISSION    = 17 // 权限不足（只读挂载点上的写操作等）
+	ECODE_VFS_NOT_EMPTY     = 18 // 目录非空
+	ECODE_VFS_IS_DIR        = 19 // 目标（或源）是目录
+	ECODE_VFS_NOT_DIR       = 20 // 目标不是目录
+	ECODE_VFS_READ_ONLY     = 21 // 只读文件系统
+	ECODE_VFS_NO_SPACE      = 22 // 空间不足（超出 Share 配额）
+	ECODE_VFS_INVALID       = 23 // 参数非法（路径格式、偏移、名称等）
+	ECODE_VFS_NOT_SUPPORTED = 24 // 该挂载点不支持的操作
+	ECODE_VFS_BUSY          = 25 // 资源忙（如锁冲突）
+	ECODE_VFS_NAME_TOO_LONG = 26 // 名称超过长度上限
+	ECODE_VFS_LOOP          = 27 // 符号链接层数过多
+	ECODE_VFS_CROSS_DEVICE  = 28 // 跨挂载点操作（跨 Share 的 Rename/Copy）
+	ECODE_VFS_ENCRYPTED     = 29 // Share 启用了加密，但会话里没有可用密钥（要用口令打开）
 )
 
 // ── 错误码（字符串） ──
@@ -46,6 +64,23 @@ const (
 	ESTR_CHUNK_EMPTY       = "CHUNK_EMPTY"
 	ESTR_CHUNK_SIZE_EXCEED = "CHUNK_SIZE_EXCEED"
 	ESTR_CHUNK_NOT_FOUND   = "CHUNK_NOT_FOUND"
+
+	// vfs 的 POSIX 语义错误（与 ECODE_VFS_* 一一对应）
+	ESTR_VFS_NOT_FOUND     = "VFS_NOT_FOUND"
+	ESTR_VFS_EXIST         = "VFS_EXIST"
+	ESTR_VFS_PERMISSION    = "VFS_PERMISSION"
+	ESTR_VFS_NOT_EMPTY     = "VFS_NOT_EMPTY"
+	ESTR_VFS_IS_DIR        = "VFS_IS_DIR"
+	ESTR_VFS_NOT_DIR       = "VFS_NOT_DIR"
+	ESTR_VFS_READ_ONLY     = "VFS_READ_ONLY"
+	ESTR_VFS_NO_SPACE      = "VFS_NO_SPACE"
+	ESTR_VFS_INVALID       = "VFS_INVALID"
+	ESTR_VFS_NOT_SUPPORTED = "VFS_NOT_SUPPORTED"
+	ESTR_VFS_BUSY          = "VFS_BUSY"
+	ESTR_VFS_NAME_TOO_LONG = "VFS_NAME_TOO_LONG"
+	ESTR_VFS_LOOP          = "VFS_LOOP"
+	ESTR_VFS_CROSS_DEVICE  = "VFS_CROSS_DEVICE"
+	ESTR_VFS_ENCRYPTED     = "VFS_ENCRYPTED"
 )
 
 // ZenoError 是系统的标准错误类型，包含数值码、字符串码和上下文。
@@ -85,3 +120,7 @@ func (e *ZenoError) Error() string {
 	}
 	return e.Message
 }
+
+// Unwrap 暴露被包装的原始错误，让 errors.Is / errors.As 能穿透到它。
+// 例：vfs 把 POSIX 哨兵错误包成 ZenoError 后，调用方仍可用 errors.Is 判定。
+func (e *ZenoError) Unwrap() error { return e.InnerErr }
