@@ -22,11 +22,23 @@ func wrapDB(err error) error {
 }
 
 // parentID 把节点转换成 "parent_id" 列值；根目录（Id 0）对应 NULL。
-func parentID(in db.Inode) sql.NullInt64 {
+// refOf 把一个 inode 包成 parent_id 列用的引用（0 表示"没有父"，即挂载根）。
+//
+// 注意它返回的是**这个 inode 自己的 id**，不是它的父目录——它以前叫 parentID，
+// 正因如此被误当成"源文件的父目录"，导致改名总被记成移动。
+func refOf(in db.Inode) sql.NullInt64 {
 	if in.Id == 0 {
 		return sql.NullInt64{}
 	}
 	return sql.NullInt64{Int64: in.Id, Valid: true}
+}
+
+// parentOf 返回 inode 所在目录的 id；父为空（挂在根下）返回 0。
+func parentOf(in db.Inode) int64 {
+	if in.ParentId.Valid {
+		return in.ParentId.Int64
+	}
+	return 0
 }
 
 // checkName 校验单个文件名的合法性。
@@ -64,7 +76,7 @@ func (fs *ShareFS) isDescendant(ancestorID, nodeID int64) bool {
 // 数据与历史版本都保留，后续的"已删除文件恢复/清空"功能依赖这一点。
 func (fs *ShareFS) markDeleted(in db.Inode, ev db.InodeEventType) error {
 	now := time.Now().Unix()
-	return fs.pm.DbManager.DB.Transaction(func(tx *gorm.DB) error {
+	return fs.pm.DbManager.Tx(func(tx *gorm.DB) error {
 		if err := tx.Model(&db.Inode{}).Where("id = ?", in.Id).
 			Updates(map[string]any{
 				"deleted":    1,
@@ -125,7 +137,7 @@ func (fs *ShareFS) Mkdir(_ context.Context, p string, mode FileMode) error {
 	}
 
 	in := db.Inode{
-		ParentId:   parentID(parent),
+		ParentId:   refOf(parent),
 		Name:       name,
 		Kind:       db.InodeDir,
 		ShareId:    fs.share.Id,
@@ -232,7 +244,7 @@ func (fs *ShareFS) Rename(_ context.Context, oldPath, newPath string) error {
 	}
 
 	now := time.Now().Unix()
-	return fs.pm.DbManager.DB.Transaction(func(tx *gorm.DB) error {
+	return fs.pm.DbManager.Tx(func(tx *gorm.DB) error {
 		if overwrite != nil {
 			if err := tx.Model(&db.Inode{}).Where("id = ?", overwrite.Id).
 				Updates(map[string]any{"deleted": 1, "updated_by": fs.userID, "updated_at": now}).
@@ -242,15 +254,16 @@ func (fs *ShareFS) Rename(_ context.Context, oldPath, newPath string) error {
 		}
 		if err := tx.Model(&db.Inode{}).Where("id = ?", src.Id).
 			Updates(map[string]any{
-				"parent_id":  parentID(dstDir),
+				"parent_id":  refOf(dstDir),
 				"name":       name,
 				"updated_by": fs.userID,
 				"updated_at": now,
 			}).Error; err != nil {
 			return errs.DBQuery(err)
 		}
+		// 改名还是移动，看新旧父目录变没变（dstDir 就是新父目录）
 		ev := db.InodeRenamed
-		if parentID(src) != parentID(dstDir) {
+		if parentOf(src) != dstDir.Id {
 			ev = db.InodeMoved
 		}
 		return wrapDB(tx.Create(&db.InodeHistory{
@@ -258,8 +271,8 @@ func (fs *ShareFS) Rename(_ context.Context, oldPath, newPath string) error {
 			EventType:   ev,
 			OldName:     sql.NullString{String: src.Name, Valid: true},
 			NewName:     sql.NullString{String: name, Valid: true},
-			OldParentId: parentID(src),
-			NewParentId: parentID(dstDir),
+			OldParentId: src.ParentId,
+			NewParentId: refOf(dstDir),
 			CreatedAt:   now,
 		}).Error)
 	})
@@ -306,7 +319,7 @@ func (fs *ShareFS) Symlink(_ context.Context, target, linkPath string) error {
 	}
 
 	in := db.Inode{
-		ParentId:  parentID(parent),
+		ParentId:  refOf(parent),
 		Name:      name,
 		Kind:      db.InodeLink,
 		ShareId:   fs.share.Id,

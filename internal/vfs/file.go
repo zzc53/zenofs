@@ -133,7 +133,7 @@ func (fs *ShareFS) createInode(parentPath, name string, kind db.InodeKind, mode 
 		return db.Inode{}, err
 	}
 	in := db.Inode{
-		ParentId:   parentID(dir),
+		ParentId:   refOf(dir),
 		Name:       name,
 		Kind:       kind,
 		ShareId:    fs.share.Id,

@@ -289,3 +289,67 @@ func TestAddDiskTypeAndParityRules(t *testing.T) {
 		t.Fatalf("非法 type = %d, want 400", status)
 	}
 }
+
+// 加盘的路径规则：空路径、相对路径、重复路径都要给出可读的错误原因，
+// 而不是把底层的唯一约束错误兜底成一句没头没脑的 400。
+func TestAddDiskPathRules(t *testing.T) {
+	env, srv := newTestServer(t)
+	resp := do(t, http.MethodPost, srv.URL+"/api/pools", []byte(`{"name":"p","chunk_size_kb":64}`))
+	poolID := int64(decode(t, resp)["Id"].(float64))
+	addURL := fmt.Sprintf("%s/api/pools/%d/disks", srv.URL, poolID)
+
+	post := func(body map[string]any) (int, map[string]any) {
+		t.Helper()
+		raw, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp := do(t, http.MethodPost, addURL, raw)
+		return resp.StatusCode, decode(t, resp)
+	}
+	expectErr := func(desc string, status int, view map[string]any, wantStatus int, wantStrCode string) {
+		t.Helper()
+		if status != wantStatus {
+			t.Fatalf("%s = %d, want %d", desc, status, wantStatus)
+		}
+		if got := view["str_code"]; got != wantStrCode {
+			t.Fatalf("%s 的 str_code = %v, want %s", desc, got, wantStrCode)
+		}
+		// 前端就是靠这个 message 告诉用户哪里不对，空字符串等于没说
+		if msg, _ := view["message"].(string); msg == "" {
+			t.Fatalf("%s 的错误 message 是空的", desc)
+		}
+	}
+
+	// 空路径：不能建出一块"看起来加上了、其实不知道往哪写"的盘
+	status, view := post(map[string]any{"path": "", "type": "data"})
+	expectErr("空路径加盘", status, view, http.StatusBadRequest, "DISK_BAD_PATH")
+
+	// 相对路径：会随进程工作目录漂移
+	status, view = post(map[string]any{"path": "disk0", "type": "data"})
+	expectErr("相对路径加盘", status, view, http.StatusBadRequest, "DISK_BAD_PATH")
+
+	// 正常路径可以加
+	diskPath := env.Path("d0")
+	if status, view = post(map[string]any{"path": diskPath}); status != http.StatusCreated {
+		t.Fatalf("加数据盘 = %d, want 201（%v）", status, view)
+	}
+
+	// 同一个路径再加一次：409，并说清是路径被占用了
+	status, view = post(map[string]any{"path": diskPath})
+	expectErr("重复路径加盘", status, view, http.StatusConflict, "DISK_EXIST")
+
+	// 被拒绝的这几次不该在池里留下分片
+	pool := decode(t, do(t, http.MethodGet, fmt.Sprintf("%s/api/pools/%d", srv.URL, poolID), nil))
+	if pool["DataShards"] != float64(1) || pool["ParityShards"] != float64(0) {
+		t.Fatalf("池分片数 = %v/%v，期望 1/0", pool["DataShards"], pool["ParityShards"])
+	}
+
+	// 缓存盘也要守同样的路径规则
+	cachePath := env.Path("cache0")
+	if status, view = post(map[string]any{"path": cachePath, "type": "cache"}); status != http.StatusCreated {
+		t.Fatalf("加缓存盘 = %d, want 201（%v）", status, view)
+	}
+	status, view = post(map[string]any{"path": cachePath, "type": "cache"})
+	expectErr("重复路径加缓存盘", status, view, http.StatusConflict, "DISK_EXIST")
+}

@@ -43,7 +43,7 @@ func rebuildTaskName(poolId int64) string {
 func (p *PoolManager) RebuildPool(poolId int64) (int, error) {
 	var queued int
 
-	err := p.DbManager.DB.Transaction(func(tx *gorm.DB) error {
+	err := p.DbManager.Tx(func(tx *gorm.DB) error {
 		// 1. 作业级去重：同一个 pool 同时只允许一个进行中的重建作业
 		var active int64
 		if err := tx.Model(&db.Task{}).
@@ -142,7 +142,7 @@ type rebuiltChunk struct {
 // 所在的条带建任务（TaskId 为 0，不挂作业），供读路径发现坏分片时即时修复。
 func (p *PoolManager) RebuildByChunks(chunkIds []int64) (int, error) {
 	var queued int
-	err := p.DbManager.DB.Transaction(func(tx *gorm.DB) error {
+	err := p.DbManager.Tx(func(tx *gorm.DB) error {
 		var stripeIds []int64
 		if err := tx.Model(&db.Chunk{}).Distinct("stripe_id").
 			Where("id IN ?", chunkIds).Pluck("stripe_id", &stripeIds).Error; err != nil {

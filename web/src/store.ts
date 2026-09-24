@@ -17,6 +17,8 @@ export const setupActive = signal(false)
 
 /** msg 把任意错误转成可展示的文案。 */
 export function msg(err: unknown): string {
+  // ApiError 的 message 在构造时已经优先取了后端的 message，后端保证它非空
+  // （没有 message 时退回 str_code），所以这里直接用就行。
   if (err instanceof ApiError) return err.message || t('unknownError')
   if (err instanceof Error) return err.message
   return String(err)

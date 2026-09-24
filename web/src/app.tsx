@@ -65,7 +65,7 @@ export function App() {
           </select>
           <span class="who">{user.username}</span>
           <button
-            class="link"
+            class="btn-secondary"
             onClick={() => {
               logout()
               navigate('#/login')

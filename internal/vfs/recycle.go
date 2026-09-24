@@ -75,7 +75,7 @@ func (fs *ShareFS) Restore(_ context.Context, inodeId int64) (FileInfo, error) {
 	}
 
 	now := time.Now().Unix()
-	if err := fs.pm.DbManager.DB.Transaction(func(tx *gorm.DB) error {
+	if err := fs.pm.DbManager.Tx(func(tx *gorm.DB) error {
 		if err := tx.Model(&db.Inode{}).Where("id = ?", in.Id).
 			Updates(map[string]any{
 				"deleted":    0,
@@ -186,7 +186,7 @@ func (fs *ShareFS) ensureNoConflict(parent sql.NullInt64, name string) error {
 
 // purgeInode 删掉一个 inode 及其全部子项、版本与版本切片映射。
 func (fs *ShareFS) purgeInode(id int64) error {
-	return fs.pm.DbManager.DB.Transaction(func(tx *gorm.DB) error {
+	return fs.pm.DbManager.Tx(func(tx *gorm.DB) error {
 		// 先收集整棵子树（inode 层级很浅，宽度优先足够）
 		ids := []int64{id}
 		for i := 0; i < len(ids); i++ {

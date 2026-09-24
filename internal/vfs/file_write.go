@@ -307,7 +307,7 @@ func (f *fileHandle) Close() error {
 	}
 
 	now := time.Now().Unix()
-	return f.fs.pm.DbManager.DB.Transaction(func(tx *gorm.DB) error {
+	return f.fs.pm.DbManager.Tx(func(tx *gorm.DB) error {
 		if err := tx.Model(&db.Version{}).Where("id = ?", f.newVer.Id).
 			Updates(map[string]any{"size": f.newVer.Size}).Error; err != nil {
 			return errs.DBQuery(err)

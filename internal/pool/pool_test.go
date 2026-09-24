@@ -2,6 +2,8 @@ package pool
 
 import (
 	"errors"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/zzc53/zenofs/internal/db"
@@ -260,5 +262,73 @@ func TestHandlerFor(t *testing.T) {
 	}
 	if h := pm.handlerFor(db.S3Backend); h != nil {
 		t.Fatalf("未注册的后端应返回 nil，得到 %v", h)
+	}
+}
+
+// 空路径的盘（早期版本允许加出来，属于历史脏数据）不该被选中存数据：
+// 它写到哪儿取决于进程的工作目录，会悄悄把 chunk 写错地方。
+func TestEmptyPathDiskIsExcluded(t *testing.T) {
+	env, pm := newEnv(t)
+	p := env.NewPool("p", 1, 0, 4096) // 这个 helper 已经建好 1 块数据盘
+
+	var disk db.Disk
+	if err := env.DB.DB.Where("pool_id = ? AND type = ?", p.Id, db.DataDisk).First(&disk).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	// 清空路径，模拟历史脏数据（池的分片计数里还算着这块盘）。
+	// 用裸 SQL：GORM 的 Update 会把这里当零值处理，可能不落库。
+	if err := env.DB.DB.Exec("UPDATE disks SET path = '' WHERE id = ?", disk.Id).Error; err != nil {
+		t.Fatal(err)
+	}
+	var after db.Disk
+	if err := env.DB.DB.First(&after, disk.Id).Error; err != nil {
+		t.Fatal(err)
+	}
+	if after.Path != "" {
+		t.Fatalf("清空路径没生效，得到 %q", after.Path)
+	}
+
+	if _, err := pm.AddChunks(p.Id, [][]byte{testutil.RandBytes(31, 4096)}); err == nil {
+		t.Fatalf("池里只有空路径盘时，写入必须失败而不是把 chunk 写到工作目录")
+	}
+}
+
+// 并发写入不能撞上 SQLite 的写锁。
+//
+// getNewChunks 的事务是"先读（查预留槽位）后写（建 stripe）"：如果事务用默认的
+// BEGIN DEFERRED 开始，两个并发事务会各自拿着共享锁再抢升级，SQLite 对这种死锁
+// 是**立即**返回 SQLITE_BUSY 的，busy_timeout 也救不了（等下去也不会有人放手）。
+// 解决办法是让事务用 BEGIN IMMEDIATE 开始（DSN 里的 _txlock=immediate）。
+//
+// 这是 database is locked 的回归测试：去掉 _txlock=immediate 后它必然失败。
+func TestConcurrentAddChunksNoLockError(t *testing.T) {
+	env, pm := newEnv(t)
+	p := env.NewPool("p", 2, 1, 4096)
+
+	const goroutines = 8
+	const perGoroutine = 4
+	var wg sync.WaitGroup
+	failures := make(chan error, goroutines)
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < perGoroutine; i++ {
+				data := testutil.RandBytes(int64(g*1000+i), 1024)
+				if _, err := pm.AddChunks(p.Id, [][]byte{data}); err != nil {
+					failures <- err
+					return
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	close(failures)
+	for err := range failures {
+		if strings.Contains(err.Error(), "database is locked") {
+			t.Fatalf("并发写入撞上 SQLite 写锁: %v", err)
+		}
+		t.Fatalf("并发写入失败: %v", err)
 	}
 }

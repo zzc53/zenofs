@@ -15,3 +15,8 @@ export function isShareLocked(share?: ShareView | null): boolean {
 export function isShareUnlocked(share?: ShareView | null): boolean {
   return share?.encrypted === true && share.unlocked === true
 }
+
+/** canWrite 判断当前用户在这个共享里能不能写（上传、改名、恢复版本都需要）。 */
+export function canWrite(share?: ShareView | null): boolean {
+  return share?.permission === 'write' || share?.permission === 'admin'
+}

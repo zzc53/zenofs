@@ -48,6 +48,13 @@ type stripeResult struct {
 func (p *PoolManager) computeStripe(stripeId int64, dataShards, parityShards int,
 	dataChunks []db.Chunk, parityByIndex map[int64]db.Chunk, diskById map[int64]db.Disk) ([]stripeResult, bool) {
 
+	// 0. 池里没有校验分片（ParityShards == 0，纯条带池）：本来就没有 parity 要算，
+	// 直接返回。少了这个早退，下面会把整条带的 data chunk 全读进内存、
+	// 再喂给 reedsolomon 编码出 0 个分片——纯粹的 I/O 和内存浪费。
+	if parityShards == 0 {
+		return nil, true
+	}
+
 	// ---------------------------------------------------------------
 	// 1. 分配 shard 数组。shards[0..dataShards-1] 放 data，
 	// shards[dataShards..] 放 parity。
@@ -260,7 +267,7 @@ func (p *PoolManager) calculateStripeParity() bool {
 		allParityIds[i] = pu.id
 	}
 
-	err = p.DbManager.DB.Transaction(func(tx *gorm.DB) error {
+	err = p.DbManager.Tx(func(tx *gorm.DB) error {
 		// 加载 parity chunk 并更新大小和校验和
 		if len(allParityIds) > 0 {
 			var parity []db.Chunk
@@ -374,7 +381,7 @@ func (p *PoolManager) claimStripeTasks(queueType db.StripeQueueType) []db.Stripe
 		Update("status", db.TaskPending)
 
 	var entries []db.StripeQueue
-	err := p.DbManager.DB.Transaction(func(tx *gorm.DB) error {
+	err := p.DbManager.Tx(func(tx *gorm.DB) error {
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
 			Where("status = ? AND type = ?", db.TaskPending, queueType).
 			Find(&entries).Error; err != nil {

@@ -8,7 +8,7 @@ import {
   type ShareView,
 } from '../api'
 import { t } from '../i18n'
-import { msg, refreshShares, refreshStatus, setSession, setupActive } from '../store'
+import { msg, notify, refreshShares, refreshStatus, setSession, setupActive } from '../store'
 import { generateSecret, otpauthURI, totp } from '../totp'
 import { ErrorBox, Field, LangSwitch, QrCode, copyText } from '../ui'
 
@@ -49,7 +49,7 @@ export function SetupView() {
   const [sharePassword, setSharePassword] = useState('')
 
   const dataDisks = disks.filter((d) => d.Type === 0).length
-  const parityDisks = disks.filter((d) => d.Type === 1).length
+  const cacheDisks = disks.filter((d) => d.Type === 1).length
 
   async function run(fn: () => Promise<void>) {
     setBusy(true)
@@ -103,6 +103,10 @@ export function SetupView() {
       setDisks([...disks, created])
       setDiskPath('')
       setAsParity(false)
+      // 数据/校验分片数是池上的计数（同一块盘在不同条带里可能是 data 也可能是
+      // parity，由建条带时的 shuffle 决定），所以只能重新读池，不能从磁盘列表里数。
+      setPool(await api.get<PoolView>(`/api/pools/${pool.Id}`))
+      notify(t('diskAdded'))
     })
 
   const createShare = () =>
@@ -164,21 +168,21 @@ export function SetupView() {
               <QrCode text={otpauthURI(secret, username || 'zenofs')} width={168} />
               <div class="otp-side">
                 <p class="muted small">{t('otpScanHint')}</p>
-                <div class="secret">
-                  <code>{secret}</code>
-                  <button class="link" onClick={() => void copyText(secret)}>
+                <code class="secret-text">{secret}</code>
+                <div class="otp-actions">
+                  <button class="btn-secondary" onClick={() => void copyText(secret)}>
                     {t('copy')}
                   </button>
+                  <button
+                    class="btn-secondary"
+                    onClick={() => {
+                      setSecret(generateSecret())
+                      setCode('') // 换了密钥，之前那个码就作废了
+                    }}
+                  >
+                    {t('otpRefresh')}
+                  </button>
                 </div>
-                <button
-                  class="link"
-                  onClick={() => {
-                    setSecret(generateSecret())
-                    setCode('') // 换了密钥，之前那个码就作废了
-                  }}
-                >
-                  {t('otpRefresh')}
-                </button>
               </div>
             </div>
             <Field label={t('otpCode')}>
@@ -222,7 +226,12 @@ export function SetupView() {
         {step === 2 && (
           <>
             <p class="muted">
-              {t('disksAdded', { n: disks.length, d: dataDisks, p: parityDisks })}
+              {t('disksAdded', {
+                n: disks.length,
+                d: pool?.DataShards ?? 0,
+                p: pool?.ParityShards ?? 0,
+                c: cacheDisks,
+              })}
             </p>
             <Field label={t('diskType')} hint={t('hintDiskUsage')}>
               <select

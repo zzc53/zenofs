@@ -228,7 +228,7 @@ func (m *Manager) GetUser(id int64) (*db.User, error) {
 
 // DeleteUser 删除用户（同时清掉它的 Share 授权与访问凭证）。
 func (m *Manager) DeleteUser(id int64) error {
-	return m.db.DB.Transaction(func(tx *gorm.DB) error {
+	return m.db.Tx(func(tx *gorm.DB) error {
 		res := tx.Delete(&db.User{}, id)
 		if res.Error != nil {
 			return errs.DBQuery(res.Error)

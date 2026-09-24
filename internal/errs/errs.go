@@ -66,6 +66,8 @@ const (
 	ECODE_SHARE_BAD         = 47 // Share 参数非法
 	ECODE_RECYCLE_NOT_FOUND = 48 // 回收站里没有这个条目
 	ECODE_DISK_NOT_FOUND    = 49 // 磁盘不存在
+	ECODE_DISK_BAD_PATH     = 50 // 磁盘路径非法（空、相对路径）
+	ECODE_DISK_EXIST        = 51 // 这个路径已经被别的盘用了
 )
 
 // ── 错误码（字符串） ──
@@ -129,6 +131,8 @@ const (
 	ESTR_SHARE_BAD         = "SHARE_BAD"
 	ESTR_RECYCLE_NOT_FOUND = "RECYCLE_NOT_FOUND"
 	ESTR_DISK_NOT_FOUND    = "DISK_NOT_FOUND"
+	ESTR_DISK_BAD_PATH     = "DISK_BAD_PATH"
+	ESTR_DISK_EXIST        = "DISK_EXIST"
 )
 
 // ZenoError 是系统的标准错误类型，包含数值码、字符串码和上下文。

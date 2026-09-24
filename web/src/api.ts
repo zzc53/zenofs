@@ -95,8 +95,54 @@ export const api = {
   post: <T>(path: string, body?: unknown) => request<T>('POST', path, body),
   put: <T>(path: string, body?: unknown) => request<T>('PUT', path, body),
   del: <T>(path: string) => request<T>('DELETE', path),
-  /** 上传原始字节（文件内容就是 body）。 */
+  /** 上传原始字节（文件内容就是 body）。不带进度，需要进度用 uploadBlob。 */
   putBlob: <T>(path: string, data: Blob) => request<T>('PUT', path, data),
+}
+
+/**
+ * uploadBlob 上传原始字节，并通过 onProgress 汇报**上传**进度（字节）。
+ *
+ * 为什么不用 fetch：fetch 拿不到上传进度（用 ReadableStream 当请求体只有 Chromium 系
+ * 支持，写法也绕）。XMLHttpRequest 的 upload.onprogress 是唯一在主流浏览器都稳的办法。
+ *
+ * 返回 abort 是留给"取消上传"用的：目前 UI 还没接，但接口先留好。
+ */
+export function uploadBlob(
+  path: string,
+  data: Blob,
+  onProgress?: (loaded: number, total: number) => void,
+): { promise: Promise<void>; abort: () => void } {
+  const xhr = new XMLHttpRequest()
+
+  const promise = new Promise<void>((resolve, reject) => {
+    xhr.open('PUT', path)
+    if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`)
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream')
+
+    xhr.upload.onprogress = (e) => {
+      // lengthComputable 为 false 时 total 不可信，交给调用方按"不确定"处理
+      if (e.lengthComputable) onProgress?.(e.loaded, e.total)
+    }
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve()
+        return
+      }
+      let body: ApiErrorBody | null = null
+      try {
+        body = JSON.parse(xhr.responseText) as ApiErrorBody
+      } catch {
+        // 非 JSON 响应（例如网关错误页），保留状态码即可
+      }
+      reject(new ApiError(xhr.status, body, `PUT ${path} failed (${xhr.status})`))
+    }
+    xhr.onerror = () => reject(new ApiError(0, null, `PUT ${path} failed`))
+    xhr.onabort = () => reject(new ApiError(0, null, `PUT ${path} aborted`))
+
+    xhr.send(data)
+  })
+
+  return { promise, abort: () => xhr.abort() }
 }
 
 // downloadURL 拼一个能直接用 <a href> / window.open 打开的下载链接。
@@ -165,6 +211,30 @@ export interface FileView {
   mode: number
   mtime: number
   target?: string
+}
+
+/** VersionView 是文件的一个版本（对应 vfs.VersionEntry）。 */
+export interface VersionView {
+  id: number
+  size: number
+  hash: string
+  compression: number
+  encryption: number
+  created_by: number
+  created_at: number
+  is_current: boolean
+}
+
+/** HistoryView 是一条元数据变更记录（对应 vfs.HistoryEntry）。 */
+export interface HistoryView {
+  id: number
+  event: 'created' | 'renamed' | 'moved' | 'deleted' | 'restored' | 'unknown'
+  old_name?: string
+  new_name?: string
+  /** 父目录路径（不是 inode id）；父目录也没了就为空 */
+  old_parent?: string
+  new_parent?: string
+  created_at: number
 }
 
 export interface DeletedView extends FileView {

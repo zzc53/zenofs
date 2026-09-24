@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'preact/hooks'
 import {
   api,
   downloadURL,
+  uploadBlob,
   type DirListView,
   type FileView,
   type UsageView,
@@ -10,7 +11,19 @@ import { t } from '../i18n'
 import { filesURL, navigate, recycleURL } from '../router'
 import { isShareLocked } from '../share'
 import { msg, notify, refreshShares, shares } from '../store'
+import { HistoryModal } from '../history'
 import { Empty, ErrorBox, Field, Modal, fmtBytes, fmtTime } from '../ui'
+
+/** UploadState 描述"正在上传哪个文件、传了多少字节"。 */
+interface UploadState {
+  name: string
+  /** 第几个文件 / 一共几个（多选上传时用） */
+  index: number
+  count: number
+  loaded: number
+  /** 0 表示总大小未知 */
+  total: number
+}
 
 /** join 把目录与文件名拼成绝对路径。 */
 function join(dir: string, name: string): string {
@@ -34,6 +47,8 @@ export function FilesView({ shareId, dirPath }: { shareId?: number; dirPath: str
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
   const [busy, setBusy] = useState('')
+  const [upload, setUpload] = useState<UploadState | null>(null)
+  const [historyOf, setHistoryOf] = useState<FileView | null>(null)
   const [dragging, setDragging] = useState(false)
 
   const [newFolder, setNewFolder] = useState<string | null>(null)
@@ -72,18 +87,23 @@ export function FilesView({ shareId, dirPath }: { shareId?: number; dirPath: str
   async function uploadFiles(files: File[]) {
     if (!activeId || locked || files.length === 0) return
     let ok = 0
-    for (const f of files) {
+    for (const [i, f] of files.entries()) {
+      setUpload({ name: f.name, index: i + 1, count: files.length, loaded: 0, total: f.size })
       setBusy(t('uploading', { name: f.name }))
       try {
-        await api.putBlob(
+        // 上传走 XHR（uploadBlob）而不是 fetch：只有它能汇报上传进度
+        const { promise } = uploadBlob(
           `/api/shares/${activeId}/files?path=${encodeURIComponent(join(dirPath, f.name))}`,
           f,
+          (loaded, total) => setUpload((prev) => (prev ? { ...prev, loaded, total } : prev)),
         )
+        await promise
         ok++
       } catch (err) {
         notify(`${f.name}: ${msg(err)}`)
       }
     }
+    setUpload(null)
     setBusy('')
     if (ok > 0) notify(t('uploadDone', { n: ok }))
     await load()
@@ -195,7 +215,7 @@ export function FilesView({ shareId, dirPath }: { shareId?: number; dirPath: str
         <button disabled={locked} onClick={() => setNewFolder('')}>
           {t('newFolder')}
         </button>
-        <button class="link" onClick={() => activeId && navigate(recycleURL(activeId))}>
+        <button class="btn-secondary" onClick={() => activeId && navigate(recycleURL(activeId))}>
           {t('navRecycle')}
         </button>
 
@@ -208,7 +228,7 @@ export function FilesView({ shareId, dirPath }: { shareId?: number; dirPath: str
           </button>
         )}
         <span class="spacer" />
-        <button class="link" onClick={() => void load()}>
+        <button class="btn-secondary" onClick={() => void load()}>
           {t('refresh')}
         </button>
       </div>
@@ -242,7 +262,38 @@ export function FilesView({ shareId, dirPath }: { shareId?: number; dirPath: str
       </nav>
 
       <ErrorBox text={error} />
-      {busy && <p class="muted small">{busy}</p>}
+      {upload && (
+        <div class="upload-progress">
+          <div class="upload-progress-head">
+            <span class="upload-progress-name" title={upload.name}>
+              {upload.name}
+            </span>
+            <span class="muted small">
+              {upload.count > 1 ? `${upload.index}/${upload.count} · ` : ''}
+              {upload.total > 0 && upload.loaded >= upload.total ? (
+                // 字节传完了，但服务端还要编码 + 落盘，这段时间别让进度条看起来像卡住
+                <>{t('uploadProcessing')}</>
+              ) : upload.total > 0 ? (
+                `${fmtBytes(upload.loaded)} / ${fmtBytes(upload.total)}`
+              ) : (
+                fmtBytes(upload.loaded)
+              )}
+            </span>
+          </div>
+          <div class="upload-progress-bar">
+            <div
+              class="upload-progress-fill"
+              style={{
+                width:
+                  upload.total > 0
+                    ? `${Math.min(100, (upload.loaded / upload.total) * 100)}%`
+                    : '0%',
+              }}
+            />
+          </div>
+        </div>
+      )}
+      {busy && !upload && <p class="muted small">{busy}</p>}
 
       <div
         class={dragging && !locked ? 'dropzone dragging' : 'dropzone'}
@@ -292,12 +343,15 @@ export function FilesView({ shareId, dirPath }: { shareId?: number; dirPath: str
                     <td>{fmtTime(entry.mtime)}</td>
                     <td class="actions">
                       {entry.kind !== 'dir' && activeId && (
-                        <a class="link" href={downloadURL(activeId, entry.path)} download={entry.name}>
+                        <a class="btn-secondary" href={downloadURL(activeId, entry.path)} download={entry.name}>
                           {t('download')}
                         </a>
                       )}
+                      <button class="btn-secondary" onClick={() => setHistoryOf(entry)}>
+                        {t('history')}
+                      </button>
                       <button
-                        class="link"
+                        class="btn-secondary"
                         onClick={() => {
                           setRenameTarget(entry)
                           setRenameTo(entry.name)
@@ -305,7 +359,7 @@ export function FilesView({ shareId, dirPath }: { shareId?: number; dirPath: str
                       >
                         {t('renameItem')}
                       </button>
-                      <button class="link danger" onClick={() => void remove(entry)}>
+                      <button class="btn-secondary danger" onClick={() => void remove(entry)}>
                         {t('deleteItem')}
                       </button>
                     </td>
@@ -315,6 +369,10 @@ export function FilesView({ shareId, dirPath }: { shareId?: number; dirPath: str
           </table>
         )}
       </div>
+
+      {historyOf && activeId && (
+        <HistoryModal shareId={activeId} entry={historyOf} onClose={() => setHistoryOf(null)} />
+      )}
 
       {newFolder !== null && (
         <Modal title={t('newFolder')} onClose={() => setNewFolder(null)}>

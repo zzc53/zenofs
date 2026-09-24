@@ -61,6 +61,14 @@ func main() {
 	// 创建 PoolManager（本地文件系统后端）
 	pm := pool.New(dbManager, []pool.ChunkHandler{pool.NewLocalChunkHandler()})
 
+	// 收拾上一次运行留下的 write queue：写完的搬进 stripe queue（该算的校验块不漏），
+	// 半途中断的孤片清掉。放在 worker 启动之前，这样清出来的任务能被立刻消费。
+	if removed, err := pm.CleanupWriteQueueOnStartup(); err != nil {
+		log.Printf("startup: cleanup write queue failed: %v", err)
+	} else if removed > 0 {
+		log.Printf("startup: dropped %d stale write queue record(s)", removed)
+	}
+
 	// 启动后台 worker（parity 计算 + 缓存清理）
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -240,5 +241,60 @@ func TestDeleteCacheDiskEndpoint(t *testing.T) {
 	// 缓存盘没了之后，读写照常（只是不再缓存）
 	if got := readAll(t, do(t, http.MethodGet, fileURL, nil)); !bytes.Equal(got, payload) {
 		t.Fatalf("删掉缓存盘后读回内容不一致")
+	}
+}
+
+// 并发上传：多个请求同时写 chunk 时结果要正确（都成功、内容都对）。
+//
+// 注意：这个测试**不能**用来守 database is locked（它修复前后都会通过，
+// 因为 HTTP 这一层没把事务卡到同一个瞬间）。真正钉住那个 bug 的是
+// pool 包的 TestConcurrentAddChunksNoLockError。
+func TestConcurrentUploadsNoLockFailure(t *testing.T) {
+	env, srv := newTestServer(t)
+	resp := do(t, http.MethodPost, srv.URL+"/api/pools", []byte(`{"name":"p","chunk_size_kb":256}`))
+	poolID := int64(decode(t, resp)["Id"].(float64))
+	addURL := fmt.Sprintf("%s/api/pools/%d/disks", srv.URL, poolID)
+
+	for i, body := range []string{
+		fmt.Sprintf(`{"path":%q}`, env.Path("d0")),
+		fmt.Sprintf(`{"path":%q,"add_parity":true}`, env.Path("d1")),
+	} {
+		resp := do(t, http.MethodPost, addURL, []byte(body))
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("加第 %d 块盘 = %d, want 201", i+1, resp.StatusCode)
+		}
+		resp.Body.Close()
+	}
+	shareID := createShareForTest(t, srv, "docs", poolID)
+
+	const n = 8
+	var wg sync.WaitGroup
+	codes := make([]int, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			payload := bytes.Repeat([]byte{byte('a' + i)}, 64*1024)
+			resp := do(t, http.MethodPut,
+				fmt.Sprintf("%s/api/shares/%d/files?path=/f%d.bin", srv.URL, shareID, i), payload)
+			codes[i] = resp.StatusCode
+			resp.Body.Close()
+		}(i)
+	}
+	wg.Wait()
+
+	for i, code := range codes {
+		if code != http.StatusCreated {
+			t.Fatalf("并发上传第 %d 个 = %d, want 201（多半是 database is locked）", i, code)
+		}
+	}
+	// 并发写完之后，所有文件都该读得回来
+	for i := 0; i < n; i++ {
+		want := bytes.Repeat([]byte{byte('a' + i)}, 64*1024)
+		got := readAll(t, do(t, http.MethodGet,
+			fmt.Sprintf("%s/api/shares/%d/files?path=/f%d.bin", srv.URL, shareID, i), nil))
+		if !bytes.Equal(got, want) {
+			t.Fatalf("第 %d 个文件读回内容不一致（%d 字节 vs %d 字节）", i, len(got), len(want))
+		}
 	}
 }

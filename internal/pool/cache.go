@@ -28,7 +28,8 @@ const (
 // cacheDisks 返回 pool 中所有 Online 的 CacheDisk。
 func (p *PoolManager) cacheDisks(poolId int64) []db.Disk {
 	var disks []db.Disk
-	p.DbManager.DB.Where("pool_id = ? AND type = ? AND status = ?",
+	// 空路径的缓存盘同样是脏数据：读缓存失败会回退源盘，写缓存则会写错地方
+	p.DbManager.DB.Where("pool_id = ? AND type = ? AND status = ? AND path <> ''",
 		poolId, db.CacheDisk, db.Online).Find(&disks)
 	return disks
 }

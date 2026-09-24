@@ -143,7 +143,7 @@ function SharesAdmin() {
         <h2>{t('sharesTitle')}</h2>
         <span class="spacer" />
         <button onClick={() => setCreating(true)}>{t('newShare')}</button>
-        <button class="link" onClick={() => void load()}>
+        <button class="btn-secondary" onClick={() => void load()}>
           {t('refresh')}
         </button>
       </div>
@@ -180,14 +180,14 @@ function SharesAdmin() {
                 </td>
                 <td class="actions">
                   {s.encrypted && (
-                    <button class="link" onClick={() => (s.unlocked ? void lock(s) : void unlock(s))}>
+                    <button class="btn-secondary" onClick={() => (s.unlocked ? void lock(s) : void unlock(s))}>
                       {s.unlocked ? t('lockShare') : t('unlockShare')}
                     </button>
                   )}
-                  <button class="link" onClick={() => setGrantFor(s)}>
+                  <button class="btn-secondary" onClick={() => setGrantFor(s)}>
                     {t('grantedUsers')}
                   </button>
-                  <button class="link danger" onClick={() => void remove(s)}>
+                  <button class="btn-secondary danger" onClick={() => void remove(s)}>
                     {t('delete')}
                   </button>
                 </td>
@@ -319,7 +319,7 @@ function GrantModal(props: { share: ShareView; onClose: () => void; onChanged: (
           {grants.map((g) => (
             <li key={g.user_id}>
               {g.username ?? `#${g.user_id}`} · {g.permission}
-              <button class="link danger" onClick={() => void revoke(g)}>
+              <button class="btn-secondary danger" onClick={() => void revoke(g)}>
                 {t('revoke')}
               </button>
             </li>
@@ -440,7 +440,7 @@ function UsersAdmin() {
         <h2>{t('usersTitle')}</h2>
         <span class="spacer" />
         <button onClick={() => setCreating(true)}>{t('newUser')}</button>
-        <button class="link" onClick={() => void load()}>
+        <button class="btn-secondary" onClick={() => void load()}>
           {t('refresh')}
         </button>
       </div>
@@ -466,7 +466,7 @@ function UsersAdmin() {
               <td>{fmtTime(u.created_at)}</td>
               <td class="actions">
                 <button
-                  class="link"
+                  class="btn-secondary"
                   onClick={() => {
                     setEditing(u)
                     setEdit({ password: '', role: u.role, reset_otp: false, otp_secret: '', otp_code: '' })
@@ -474,7 +474,7 @@ function UsersAdmin() {
                 >
                   {t('editUser')}
                 </button>
-                <button class="link danger" disabled={u.id === me?.id} onClick={() => void remove(u)}>
+                <button class="btn-secondary danger" disabled={u.id === me?.id} onClick={() => void remove(u)}>
                   {t('delete')}
                 </button>
               </td>
@@ -513,18 +513,18 @@ function UsersAdmin() {
             <QrCode text={otpauthURI(form.otp_secret, form.username || 'zenofs')} width={150} />
             <div class="otp-side">
               <p class="muted small">{t('otpScanHint')}</p>
-              <div class="secret">
-                <code>{form.otp_secret}</code>
-                <button class="link" onClick={() => void copyText(form.otp_secret)}>
+              <code class="secret-text">{form.otp_secret}</code>
+              <div class="otp-actions">
+                <button class="btn-secondary" onClick={() => void copyText(form.otp_secret)}>
                   {t('copy')}
                 </button>
+                <button
+                  class="btn-secondary"
+                  onClick={() => setForm({ ...form, otp_secret: generateSecret(), otp_code: '' })}
+                >
+                  {t('otpRefresh')}
+                </button>
               </div>
-              <button
-                class="link"
-                onClick={() => setForm({ ...form, otp_secret: generateSecret(), otp_code: '' })}
-              >
-                {t('otpRefresh')}
-              </button>
             </div>
           </div>
           <Field label={t('otpCode')}>
@@ -589,9 +589,9 @@ function UsersAdmin() {
       {secret && (
         <Modal title={t('secretReset')} onClose={() => setSecret(null)}>
           <p class="muted">{t('otpSecretGenerated')}</p>
-          <div class="secret">
-            <code>{secret.secret}</code>
-            <button class="link" onClick={() => void copyText(secret.secret)}>
+          <code class="secret-text">{secret.secret}</code>
+          <div class="otp-actions">
+            <button class="btn-secondary" onClick={() => void copyText(secret.secret)}>
               {t('copy')}
             </button>
           </div>
@@ -669,6 +669,7 @@ function PoolsAdmin() {
         add_parity: diskForm.usage === 'data' && diskForm.add_parity,
       })
       setAddingDisk(null)
+      notify(t('diskAdded'))
       setDiskForm({ path: '', usage: 'data', add_parity: false })
       await load()
     } catch (err) {
@@ -729,7 +730,7 @@ function PoolsAdmin() {
         <h2>{t('poolsTitle')}</h2>
         <span class="spacer" />
         <button onClick={() => setCreating(true)}>{t('newPool')}</button>
-        <button class="link" onClick={() => void load()}>
+        <button class="btn-secondary" onClick={() => void load()}>
           {t('refresh')}
         </button>
       </div>
@@ -750,13 +751,13 @@ function PoolsAdmin() {
                 {p.ChunkSize} KB · {statusName(p.Status)}
               </span>
               <span class="spacer" />
-              <button class="link" onClick={() => setAddingDisk(p)}>
+              <button class="btn-secondary" onClick={() => setAddingDisk(p)}>
                 {t('addDisk')}
               </button>
-              <button class="link" onClick={() => void rebuild(p)}>
+              <button class="btn-secondary" onClick={() => void rebuild(p)}>
                 {t('rebuild')}
               </button>
-              <button class="link danger" onClick={() => void offline(p)}>
+              <button class="btn-secondary danger" onClick={() => void offline(p)}>
                 {t('offline')}
               </button>
             </div>
@@ -780,12 +781,12 @@ function PoolsAdmin() {
                     <td class="actions">
                       {d.Type === 1 ? (
                         // 缓存盘上的数据只是副本：直接删掉即可，不需要"换盘 + 重建"
-                        <button class="link danger" onClick={() => void deleteCacheDisk(d)}>
+                        <button class="btn-secondary danger" onClick={() => void deleteCacheDisk(d)}>
                           {t('delete')}
                         </button>
                       ) : (
                         <button
-                          class="link"
+                          class="btn-secondary"
                           onClick={() => {
                             setSwapping(d)
                             setSwapPath(d.Path)
@@ -1027,7 +1028,7 @@ function TokensAdmin() {
         <span class="spacer" />
         <button onClick={() => setCreating(true)}>{t('newToken')}</button>
         <button onClick={() => setAddingKey(true)}>{t('addPubKey')}</button>
-        <button class="link" onClick={() => userId !== null && void loadTokens(userId)}>
+        <button class="btn-secondary" onClick={() => userId !== null && void loadTokens(userId)}>
           {t('refresh')}
         </button>
       </div>
@@ -1057,7 +1058,7 @@ function TokensAdmin() {
                 <td>{tok.last_used_at ? fmtTime(tok.last_used_at) : '-'}</td>
                 <td class="actions">
                   {tok.kind === 'public_key' && <span class="muted small">{tok.fingerprint}</span>}
-                  <button class="link danger" onClick={() => void revoke(tok)}>
+                  <button class="btn-secondary danger" onClick={() => void revoke(tok)}>
                     {t('revoke')}
                   </button>
                 </td>
@@ -1112,9 +1113,9 @@ function TokensAdmin() {
       {newToken && (
         <Modal title={t('tokenValue')} onClose={() => setNewToken('')}>
           <p class="muted">{t('tokenShownOnce')}</p>
-          <div class="secret">
-            <code>{newToken}</code>
-            <button class="link" onClick={() => void copyText(newToken)}>
+          <code class="secret-text">{newToken}</code>
+          <div class="otp-actions">
+            <button class="btn-secondary" onClick={() => void copyText(newToken)}>
               {t('copy')}
             </button>
           </div>

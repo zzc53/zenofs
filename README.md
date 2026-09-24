@@ -47,6 +47,31 @@ cd web && npm ci && npm run build     # 构建前端（产物 embed 进二进制
 DSN 前缀决定驱动（`sqlite://` / `mysql://` / `postgres://`）。HTTP 端口取自 `settings` 表的
 `HTTP_PORT`（默认 8080）。
 
+SQLite 这边是三件互相配合的事（见 `internal/db`）：
+
+1. **连接参数**：WAL（读不挡写）、`foreign_keys`、`busy_timeout=5000`（锁等待上限），以及
+   `_txlock=immediate`（事务用 `BEGIN IMMEDIATE`）。最后这条针对的是一个具体的坑：
+   `getNewChunks` 的事务是"先读预留槽位、再建 stripe"，如果事务以默认的 `BEGIN DEFERRED`
+   开始，两个并发写事务会各自持着共享锁再抢升级，SQLite 把这种情况判成死锁并**立即**返回
+   `SQLITE_BUSY`（`busy_timeout` 对死锁无效——等下去也不会有人放手），日志里就是
+   `chunk.go:... database is locked`。
+2. **单连接**：`SetMaxOpenConns(1)`。SQLite 是单写者数据库，与其放多个连接去抢那把写锁
+   （抢不到就耗 `busy_timeout`，请求一多看起来就是卡死），不如只留一个连接、让事务在应用层
+   排队——排队是能被超时打断的。WAL 下读本来就不挡写，代价是并发读。
+3. **事务超时**：所有事务都走 `DbManager.Tx()`（而不是直接 `DB.Transaction`），默认 15 秒，
+   由 `TxTimeout` 调。超时会取消底层 context，卡住的事务最坏只是失败，不会把后面的请求
+   一起拖死。
+
+`Tx()` 还会把跑得慢的、以及被超时掐断的事务记进日志，并附上连接池状态：
+
+```
+db: transaction took 300ms (timeout 300ms, err=context deadline exceeded) [pool open=1 in_use=1 idle=0 wait=1]
+```
+
+`wait` 持续增长就说明有事务占着连接不放——这正是"数据库卡死"的样子；光看错误信息是看不出来的，
+所以这几个数字要留在日志里。慢 SQL（>1s）由 GORM 自己记录。
+
+
 ## 测试
 
 ```bash
@@ -204,6 +229,10 @@ internal/vfs/      文件系统层（SMB / WebDAV / SFTP 共用）：接口定�
   没有数据盘就没有东西可缓存，同样报 `POOL_BAD`）、**缓存盘带 `add_parity` 直接 400**
   （而不是悄悄忽略）。Web UI 也按这个来：选了缓存盘就不显示 parity 选项；池里还没有数据盘时
   缓存盘选项直接禁用。
+- 加盘的路径规则：`path` **必须是非空的绝对路径**（相对路径会随进程工作目录漂移，空路径则会
+  得到一块"看着加上了、其实不知道往哪写"的盘）→ `400 DISK_BAD_PATH`；**同一个目录只能当一块盘**，
+  重复会撞 `disks.path` 唯一约束 → `409 DISK_EXIST`（而不是把底层的 UNIQUE 报错兜成 400）。
+  选盘建条带 / 选缓存盘时都会跳过 `path` 为空的脏数据盘，避免把 chunk 写进进程工作目录。
 - `DeleteCacheDisk(diskId)` / `DELETE /api/disks/{diskId}`：**删除缓存盘**（仅管理员），
   连同盘上的缓存文件与 `read_caches` 记录一起清掉，返回 `{"status":"deleted","removed_caches":N}`。
   只允许删缓存盘——数据盘（含 parity 位）是唯一数据副本，删掉会丢数据，那种情况走
@@ -253,7 +282,20 @@ internal/vfs/      文件系统层（SMB / WebDAV / SFTP 共用）：接口定�
 
 ### 条带 parity 计算 —— `Flush` → `calculateStripeParity`
 
-写完数据后**需要调用 `Flush(chunkIds)`**（`chunkIds` 为空表示全库），parity 才会被计算：
+写完数据后**需要调用 `Flush(chunkIds)`**（`chunkIds` 为空表示全库），parity 才会被计算。
+
+**调用点**：`persistChunkData`（`AddChunks` / `WriteChunks` 共用）在写盘结果落库**之后**调一次
+`Flush(ids)`——必须在结果落库之后，因为 `Flush` 靠 `Pending → Success/Fail` 的记录对判定"一轮写完"。
+这样 HTTP API / SMB / SFTP / WebDAV 四条写入路径都会即时生成校验块。
+
+服务启动时会跑一次 `CleanupWriteQueueOnStartup`：先全库 `Flush` 一遍（上次运行写完但还没搬的记录
+重新进 `stripe_queues`，该算的校验块不会因为一次重启就漏掉），再把剩下的记录清掉——那些都是上次
+运行半途中断的孤片（写盘意图记下了、结果没来得及记），对应的 chunk 仍是 `Reserved` 槽位，会被后续
+写入当作可复用的位置，所以丢掉等价于"那次写入没提交"。
+
+漏掉这一步的后果值得记一笔：`Flush` 是项目里**唯一**往 `stripe_queues` 投递的入口，
+少了它 `stripe_queues` 永远是空的，校验块永远停在 `Reserved` 空占位（校验盘上只有一个预分配的
+空文件）——冗余保护看着有、其实完全没生效。
 
 1. `Flush`（单事务）：
    - 取 `write_queues`（按 `chunk_id, id` 排序），找出**相邻**的 `Pending → Success/Fail` 对，即"一轮写完"；
@@ -409,6 +451,8 @@ func firstErr(errs []error) error
 | 回收站 | 列出、恢复、彻底删除、清空 |
 | 管理 · 共享 | 新建（可选口令启用加密）、改配额/压缩、授权（read/write/admin）、解锁/取消解密、强制删除 |
 | 管理 · 用户 | 新建（角色 + OTP）、改密码/角色、重置 OTP（新密钥只显示一次）、删除 |
+| 文件 · 历史 | 文件/目录的版本列表与变更记录；恢复到任一版本（只读共享禁用） |
+| 回收站 · 历史 | 被删条目同样能查看版本与变更记录，再决定还原或彻底删除 |
 | 管理 · 存储池 | 建池、加盘（先选用途：数据盘 / 缓存盘；数据盘且池里已有盘时才出现“计入校验分片”，池里没有数据盘时缓存盘不可选）、下线、换盘、重建（reconstruct）、删除缓存盘、后台任务列表 |
 | 管理 · 凭证 | 生成访问 token（明文只显示一次）、注册 SFTP 公钥、吊销 |
 
@@ -510,9 +554,12 @@ npm test          # 纯函数测试（前端算的 TOTP 必须与服务端一致
 | `GET /api/pools/{id}` | 查询存储池 |
 | `PUT /api/pools/{id}/offline` | 下线（暂停所有操作） |
 | `GET /api/pools/{id}/disks` | 列出池里的磁盘 |
-| `POST /api/pools/{poolId}/disks` | 加盘：`type` 选 `data` / `cache`，`data` 盘可带 `add_parity` |
+| `POST /api/pools/{poolId}/disks` | 加盘：`type` 选 `data` / `cache`，`data` 盘可带 `add_parity`；`path` 必须是没被占用的绝对路径 |
 | `PUT /api/disks/{diskId}/swap` | 换盘（转 Repair 并投递重建） |
 | `DELETE /api/disks/{diskId}` | 删除缓存盘（连同缓存文件与记录；管理员） |
+| `GET /api/shares/{id}/inodes/{inodeId}/versions` | 文件版本列表（新的在前，标出当前版本） |
+| `GET /api/shares/{id}/inodes/{inodeId}/history` | 元数据变更记录（创建/改名/移动/删除/恢复） |
+| `POST /api/shares/{id}/versions/{versionId}/restore` | 恢复到某个版本（需写权限） |
 | `POST /api/pools/{id}/rebuild` | 投递条带重建（reconstruct；`/reconstruct` 是同义别名） |
 | `POST /api/pools/{poolId}/chunks`、`GET`/`PUT` `/api/chunks/{id}` | 分片级读写（存储层内部用） |
 

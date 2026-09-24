@@ -93,8 +93,11 @@ func (p *PoolManager) getNewChunks(poolId int64, items []ChunkData) ([]db.Chunk,
 	// ---------------------------------------------------------------
 	// 查询 pool 中所有在线的 data 盘，Phase 2 建新 stripe 时会用到。
 	// ---------------------------------------------------------------
+	// path 为空的盘是历史脏数据（早期版本允许加空路径的盘）：它写到哪儿取决于
+	// 进程的工作目录，绝不能用来存数据。这里直接排除，让盘数不足暴露成明确错误，
+	// 而不是悄悄把 chunk 写到莫名其妙的地方去。
 	var disks []db.Disk
-	if err := p.DbManager.DB.Where("pool_id = ? AND status = ? AND type = ?",
+	if err := p.DbManager.DB.Where("pool_id = ? AND status = ? AND type = ? AND path <> ''",
 		poolId, db.Online, db.DataDisk).Find(&disks).Error; err != nil {
 		return nil, errs.DBQuery(err)
 	}
@@ -112,7 +115,7 @@ func (p *PoolManager) getNewChunks(poolId int64, items []ChunkData) ([]db.Chunk,
 
 	var chunks []db.Chunk
 
-	err = p.DbManager.DB.Transaction(func(tx *gorm.DB) error {
+	err = p.DbManager.Tx(func(tx *gorm.DB) error {
 		// ---------------------------------------------------------------
 		// 1. 消费该 pool 中已预分配的 Reserved data chunk（复用槽位少建 stripe，减少碎片）。
 		// 使用 SKIP LOCKED 防止并发写入时锁冲突（各自跳过已锁行）。
@@ -309,11 +312,12 @@ func (p *PoolManager) enqueueWriteResults(chunks []db.Chunk, writeErrs []error) 
 	return p.createWriteQueue(entries)
 }
 
-// persistChunkData 执行"写盘"的三步，AddChunks 与 WriteChunks 共用：
+// persistChunkData 执行"写盘"的几步，AddChunks 与 WriteChunks 共用：
 //
 //  3. 批量写入 write queue 的写入意图（Pending，作为崩溃后重写的依据）
 //  4. 并发把数据写到各自磁盘
 //  5. 批量写入 write queue 的写盘结果（Success / Fail）
+//  6. 把写完的这批 chunk 从 write queue 搬运到 stripe queue（触发校验块计算）
 //
 // 有分片写盘失败时返回其中一个错误——此时写盘结果已经按实际情况落库，
 // 由调用方决定是重试还是向上报错。
@@ -325,7 +329,55 @@ func (p *PoolManager) persistChunkData(chunks []db.Chunk, data [][]byte, diskByI
 	if err := p.enqueueWriteResults(chunks, writeErrs); err != nil {
 		return err
 	}
+
+	// 6. 搬运：write queue → stripe queue。
+	//
+	// 这一步不能少。parity worker 只从 stripe queue 领任务，而整个项目里**只有
+	// Flush 会往 stripe queue 里放东西**——少了它，校验块会永远停在 Reserved 的
+	// 空占位（校验盘上只有一个预分配的空文件），冗余保护形同虚设。
+	// 它必须在写盘结果落库之后调用：Flush 靠"Pending 紧跟 Success/Fail"的记录对
+	// 判定某次写入已经拿到最终结果。
+	ids := make([]int64, len(chunks))
+	for i := range chunks {
+		ids[i] = chunks[i].Id
+	}
+	if err := p.Flush(ids); err != nil {
+		return err
+	}
+
 	return firstErr(writeErrs)
+}
+
+// CleanupWriteQueueOnStartup 在服务启动时收拾上一次运行留下的 write queue。
+//
+// 分两步：
+//
+//  1. 先全库 Flush 一遍：把"已经写完"（Pending → Success/Fail 配对）的记录搬进 stripe queue，
+//     该算校验块的条带不会因为一次重启就被漏掉；
+//  2. 剩下的记录全部删掉：它们都是上一次运行半途中断留下的孤片——写盘意图记下了、
+//     结果没来得及记。对应的 chunk 仍然是 Reserved 槽位，会被后续写入当作可复用的位置，
+//     所以丢掉这些记录等价于"那次写入没提交"，是安全的。
+//
+// 返回清理掉的残留记录数。
+func (p *PoolManager) CleanupWriteQueueOnStartup() (int64, error) {
+	if err := p.Flush(nil); err != nil {
+		return 0, err
+	}
+
+	var removed int64
+	err := p.DbManager.Tx(func(tx *gorm.DB) error {
+		// GORM 默认拒绝没有条件的全表删除，这里显式给一个恒真条件
+		res := tx.Where("1 = 1").Delete(&db.WriteQueue{})
+		if res.Error != nil {
+			return errs.DBQuery(res.Error)
+		}
+		removed = res.RowsAffected
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return removed, nil
 }
 
 // ---------------------------------------------------------------
@@ -345,7 +397,7 @@ func (p *PoolManager) persistChunkData(chunks []db.Chunk, data [][]byte, diskByI
 // chunkIds 为空时处理全库的 write queue，否则只处理这批 chunk。
 // 查询、重算、入队、删除都在同一个事务里批量完成。
 func (p *PoolManager) Flush(chunkIds []int64) error {
-	return p.DbManager.DB.Transaction(func(tx *gorm.DB) error {
+	return p.DbManager.Tx(func(tx *gorm.DB) error {
 		// ---------------------------------------------------------------
 		// 1. 批量取出待检查的 write queue。
 		// 按 chunk_id, id 升序排列，同一 chunk 的记录必然连续且按写入顺序排列。

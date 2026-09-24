@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'preact/hooks'
 import { api, type DeletedView } from '../api'
+import { HistoryModal } from '../history'
 import { t } from '../i18n'
 import { filesURL, navigate } from '../router'
 import { msg, shares } from '../store'
@@ -12,6 +13,7 @@ export function RecycleView({ shareId }: { shareId?: number }) {
 
   const [entries, setEntries] = useState<DeletedView[]>([])
   const [error, setError] = useState('')
+  const [historyOf, setHistoryOf] = useState<DeletedView | null>(null)
   const [loading, setLoading] = useState(false)
 
   async function load() {
@@ -88,14 +90,14 @@ export function RecycleView({ shareId }: { shareId?: number }) {
             </option>
           ))}
         </select>
-        <button class="link" onClick={() => activeId && navigate(filesURL(activeId, '/'))}>
+        <button class="btn-secondary" onClick={() => activeId && navigate(filesURL(activeId, '/'))}>
           {t('navFiles')}
         </button>
         <span class="spacer" />
-        <button class="link danger" disabled={entries.length === 0} onClick={() => void emptyTrash()}>
+        <button class="btn-secondary danger" disabled={entries.length === 0} onClick={() => void emptyTrash()}>
           {t('emptyTrash')}
         </button>
-        <button class="link" onClick={() => void load()}>
+        <button class="btn-secondary" onClick={() => void load()}>
           {t('refresh')}
         </button>
       </div>
@@ -127,10 +129,13 @@ export function RecycleView({ shareId }: { shareId?: number }) {
                 <td>{fmtTime(entry.deleted_at)}</td>
                 <td>{entry.deleted_by || '-'}</td>
                 <td class="actions">
-                  <button class="link" onClick={() => void restore(entry)}>
+                  <button class="btn-secondary" onClick={() => setHistoryOf(entry)}>
+                    {t('history')}
+                  </button>
+                  <button class="btn-secondary" onClick={() => void restore(entry)}>
                     {t('restore')}
                   </button>
-                  <button class="link danger" onClick={() => void purge(entry)}>
+                  <button class="btn-secondary danger" onClick={() => void purge(entry)}>
                     {t('purge')}
                   </button>
                 </td>
@@ -138,6 +143,9 @@ export function RecycleView({ shareId }: { shareId?: number }) {
             ))}
           </tbody>
         </table>
+      )}
+      {historyOf && activeId && (
+        <HistoryModal shareId={activeId} entry={historyOf} onClose={() => setHistoryOf(null)} />
       )}
     </div>
   )

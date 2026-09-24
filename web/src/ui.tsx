@@ -30,7 +30,7 @@ export function Modal(props: {
       <div class="modal" onClick={(e) => e.stopPropagation()}>
         <header>
           <h3>{props.title}</h3>
-          <button class="link" onClick={props.onClose}>
+          <button class="btn-secondary" onClick={props.onClose}>
             ✕
           </button>
         </header>

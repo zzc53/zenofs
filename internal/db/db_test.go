@@ -1,12 +1,15 @@
 package db
 
 import (
+	"context"
 	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zzc53/zenofs/internal/errs"
+	"gorm.io/gorm"
 )
 
 // openTemp 在临时目录里开一个 SQLite 库。
@@ -150,5 +153,53 @@ func TestClose(t *testing.T) {
 	m := openTemp(t)
 	if err := m.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
+	}
+}
+
+// 事务超过 TxTimeout 要被掐断：卡住的操作不能永远等下去。
+func TestTxTimeoutAbortsStuckTransaction(t *testing.T) {
+	m := openTemp(t)
+	m.TxTimeout = 200 * time.Millisecond // 只影响这个测试
+
+	// 事务里先睡过超时点，再执行 SQL：这条 SQL 必须因为 context 已取消而失败
+	err := m.Tx(func(tx *gorm.DB) error {
+		time.Sleep(400 * time.Millisecond)
+		return tx.Exec("SELECT 1").Error
+	})
+	if err == nil {
+		t.Fatalf("超时之后事务里的 SQL 应当失败")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) && !strings.Contains(strings.ToLower(err.Error()), "context") {
+		t.Fatalf("期望超时类错误，得到: %v", err)
+	}
+}
+
+// 一个事务把连接占住时，后面的事务不能无休止地等——那正是"数据库卡死"的样子。
+// 连接池是单连接（SetMaxOpenConns(1)），第二个事务会排队等连接，TxTimeout 必须把它捞出来。
+func TestTxFailsFastWhenConnectionBusy(t *testing.T) {
+	m := openTemp(t)
+	m.TxTimeout = 300 * time.Millisecond
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	go func() {
+		_ = m.Tx(func(tx *gorm.DB) error {
+			close(started)
+			<-release // 一直占着连接不放
+			return nil
+		})
+	}()
+	<-started
+
+	begin := time.Now()
+	err := m.Tx(func(tx *gorm.DB) error { return nil })
+	elapsed := time.Since(begin)
+	close(release)
+
+	if err == nil {
+		t.Fatalf("第二个事务应当因为等不到连接而超时失败")
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("第二个事务等了 %s，没有在 TxTimeout 内 fail fast", elapsed)
 	}
 }

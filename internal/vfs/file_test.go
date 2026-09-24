@@ -641,3 +641,63 @@ func TestTruncateOnSliceBoundaryKeepsWholeSlice(t *testing.T) {
 		}
 	}
 }
+
+// 没有主动 flush（Sync）时，关闭文件必须自己把数据落盘。
+//
+// 这条兜底对 SFTP / WebDAV 尤其重要：它们的客户端要么没有、要么不用
+// fsync / FLUSH 这类原语，全靠关文件时的这一次提交。
+func TestCloseFlushesWithoutExplicitSync(t *testing.T) {
+	_, fs, _ := newSliced(t)
+	ctx := t.Context()
+
+	payload := testutil.RandBytes(72, 100*1024) // 不足一个切片，全在活动缓冲里
+	f, err := fs.Open(ctx, "/closed.bin",
+		OpenFlags{Read: false, Write: true, Create: true, Truncate: true}, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	// 关键：只 Close，不 Sync
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if got := readFile(t, fs, "/closed.bin", int64(len(payload))); !bytes.Equal(got, payload) {
+		t.Fatalf("Close 之后读回的内容不对")
+	}
+}
+
+// 传输崩溃（客户端断开、没来得及发 CLOSE）：已写满的切片必须已经落盘。
+//
+// vfs 在切片切换时就会 flushActive，所以一次崩溃最多丢掉"当前正在写的那个切片"，
+// 而且丢的那部分没有任何 chunk 记录——属于干净丢失，不会留下一致性垃圾。
+func TestSliceSwitchFlushesWithoutClose(t *testing.T) {
+	env, fs, _ := newSliced(t) // 切片 512KB
+	ctx := t.Context()
+
+	f, err := fs.Open(ctx, "/crash.bin",
+		OpenFlags{Read: false, Write: true, Create: true, Truncate: true}, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 写 1.5 个切片：第 1 片写满、切到第 2 片时，第 1 片应当已经落盘
+	payload := testutil.RandBytes(73, 768*1024)
+	if _, err := f.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+
+	// 这里**故意不 Close**，模拟连接崩掉
+	var allocated int64
+	if err := env.DB.DB.Model(&db.Chunk{}).
+		Where("status = ?", db.ChunkAllocated).Count(&allocated).Error; err != nil {
+		t.Fatal(err)
+	}
+	// 只有第 1 片落了盘（parity 由后台 worker 算，测试里没跑，仍是 Reserved）
+	if allocated != 1 {
+		t.Fatalf("已落盘的 data chunk = %d 个, want 1（切到下一片时应当落上一片）", allocated)
+	}
+
+	_ = f.Close()
+}

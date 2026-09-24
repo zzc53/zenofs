@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -50,13 +51,24 @@ func respondJSON(w http.ResponseWriter, status int, v any) {
 func respondErr(w http.ResponseWriter, err error) {
 	var ze *errs.ZenoError
 	if errors.As(err, &ze) {
-		respondJSON(w, statusOfCode(ze.Code), apiError{
-			Code: ze.Code, StrCode: ze.StrCode, Message: ze.Message, Value: ze.Value,
+		status := statusOfCode(ze.Code)
+		// 5xx 是服务端自己的毛病：原始错误（可能含表结构等内部细节）只进日志，
+		// 回给客户端一句可读的话，而不是让它对着空 message 猜。
+		if status >= 500 {
+			log.Printf("api: internal error: %v", err)
+		}
+		msg := ze.Message
+		if msg == "" {
+			msg = ze.StrCode
+		}
+		respondJSON(w, status, apiError{
+			Code: ze.Code, StrCode: ze.StrCode, Message: msg, Value: ze.Value,
 		})
 		return
 	}
 	if err != nil {
-		respondJSON(w, http.StatusInternalServerError, apiError{Message: err.Error()})
+		log.Printf("api: internal error: %v", err)
+		respondJSON(w, http.StatusInternalServerError, apiError{Message: "internal error"})
 	}
 }
 
@@ -82,8 +94,11 @@ func statusOfCode(code int) int {
 		errs.ECODE_RECYCLE_NOT_FOUND, errs.ECODE_VFS_NOT_FOUND, errs.ECODE_DISK_NOT_FOUND:
 		return http.StatusNotFound
 	case errs.ECODE_USER_EXIST, errs.ECODE_SHARE_EXIST, errs.ECODE_VFS_EXIST,
-		errs.ECODE_VFS_NOT_EMPTY:
+		errs.ECODE_VFS_NOT_EMPTY, errs.ECODE_DISK_EXIST:
 		return http.StatusConflict
+	case errs.ECODE_DB_BAD_QUERY:
+		// 数据库层出错是服务端自己的问题，不该顶着 400 冒充"你参数不对"
+		return http.StatusInternalServerError
 	case errs.ECODE_VFS_ENCRYPTED:
 		// 加密 Share 还没解锁（或已上锁）：423 Locked 比 403 更贴切，
 		// 客户端据此提示"先 POST /api/shares/{id}/unlock"

@@ -399,7 +399,7 @@ func (s *server) registerShareRoutes(r chi.Router) {
 			return
 		}
 		// 同一 (share, user) 只保留一条授权：先删再建
-		if err := s.pm.DbManager.DB.Transaction(func(tx *gorm.DB) error {
+		if err := s.pm.DbManager.Tx(func(tx *gorm.DB) error {
 			if err := tx.Where("share_id = ? AND user_id = ?", id, body.UserId).
 				Delete(&db.ShareUser{}).Error; err != nil {
 				return errs.DBQuery(err)
@@ -522,6 +522,7 @@ func (s *server) registerShareRoutes(r chi.Router) {
 
 	s.registerFileRoutes(r)
 	s.registerRecycleRoutes(r)
+	s.registerHistoryRoutes(r)
 }
 
 // respondShareView 回一个 Share 视图（带上当前用户在这个 Share 上的权限，如果有）。
@@ -628,7 +629,7 @@ func (s *server) listShares(u *db.User) ([]db.Share, map[int64]db.SharePermissio
 // 存储层的 chunk 不物理删除（pool 没有单块删除能力），留给后续 GC，与回收站的
 // 彻底删除保持一致。
 func (s *server) deleteShareMeta(shareId int64) error {
-	return s.pm.DbManager.DB.Transaction(func(tx *gorm.DB) error {
+	return s.pm.DbManager.Tx(func(tx *gorm.DB) error {
 		var inodeIds, versionIds []int64
 		if err := tx.Model(&db.Inode{}).Where("share_id = ?", shareId).Pluck("id", &inodeIds).Error; err != nil {
 			return errs.DBQuery(err)

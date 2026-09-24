@@ -68,42 +68,150 @@ textarea {
   color: inherit;
 }
 
+/* 按钮统一是"深色底 + 浅色字"；不同色调只用来区分层级 */
 button,
 .btn {
   display: inline-flex;
   align-items: center;
   gap: 6px;
   padding: 6px 12px;
-  border: 1px solid var(--border);
+  border: 1px solid #1f2933;
   border-radius: 6px;
-  background: #fff;
-  color: var(--text);
+  background: #1f2933;
+  color: #fff;
   font: inherit;
   cursor: pointer;
 }
 button:hover:not(:disabled),
 .btn:hover {
-  border-color: var(--accent);
+  background: #111827;
+  border-color: #111827;
 }
 button:disabled,
 .btn.disabled {
-  opacity: 0.5;
+  opacity: 0.45;
   cursor: not-allowed;
 }
+
+/* 主操作：蓝色 */
 button.primary {
   background: var(--accent);
   border-color: var(--accent);
+}
+button.primary:hover:not(:disabled) {
+  background: #1d4ed8;
+  border-color: #1d4ed8;
+}
+
+/* 次要按钮：行内的小操作（下载、改名、刷新、复制…），深灰底白字。
+   下载用的是 <a download>（要保持链接语义才能触发浏览器原生下载），所以 a 也一起覆盖。 */
+button.btn-secondary,
+a.btn-secondary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 13px;
+  background: #374151;
+  border: 1px solid #374151;
+  color: #fff;
+  text-decoration: none;
+  cursor: pointer;
+}
+button.btn-secondary:hover:not(:disabled),
+a.btn-secondary:hover {
+  background: #1f2933;
+  border-color: #1f2933;
+  color: #fff;
+  text-decoration: none;
+}
+
+/* 危险操作（删除、吊销、清空…）：深红底白字 */
+button.btn-secondary.danger,
+a.btn-secondary.danger,
+button.danger {
+  background: #991b1b;
+  border-color: #991b1b;
+}
+button.btn-secondary.danger:hover:not(:disabled),
+a.btn-secondary.danger:hover,
+button.danger:hover:not(:disabled) {
+  background: #7f1d1d;
+  border-color: #7f1d1d;
+}
+/* 上传进度：上传走 XHR 才能拿到字节进度，这里把它显示出来 */
+/* 历史弹窗里的分栏切换 */
+.tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+button.tab {
+  padding: 6px 12px;
+  border: none;
+  border-radius: 6px 6px 0 0;
+  background: none;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+button.tab:hover:not(:disabled) {
+  background: #f0f2f5;
+  color: var(--text);
+}
+
+button.tab.active {
+  background: #1f2933;
   color: #fff;
 }
-button.link {
-  border: none;
-  background: none;
-  padding: 2px 4px;
-  color: var(--accent);
+
+/* 小标签（"当前"版本） */
+.badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 12px;
 }
-button.link.danger {
-  color: var(--danger);
+
+.upload-progress {
+  margin: 4px 0 10px;
 }
+
+.upload-progress-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 4px;
+  font-size: 13px;
+}
+
+.upload-progress-name {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.upload-progress-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: #e5e7eb;
+  overflow: hidden;
+}
+
+.upload-progress-fill {
+  height: 100%;
+  width: 0;
+  border-radius: 3px;
+  background: var(--accent);
+  transition: width 0.15s linear;
+}
+
 .spacer {
   flex: 1;
 }
@@ -281,7 +389,7 @@ main {
 }
 .grid td.actions {
   display: flex;
-  gap: 8px;
+  gap: 6px;
   align-items: center;
   flex-wrap: wrap;
 }
@@ -433,16 +541,20 @@ main {
   border-radius: 6px;
   padding: 10px;
 }
-.secret {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin: 6px 0;
-}
-.secret code {
-  flex: 1;
+/* 密钥 / token 文本单独一行，操作按钮排在它下面一行 */
+.secret-text {
+  display: block;
   padding: 6px 8px;
+  background: #f0f2f5;
+  border-radius: 4px;
   word-break: break-all;
+  margin-bottom: 8px;
+}
+
+.otp-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 .toast {
   position: fixed;

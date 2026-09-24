@@ -3,6 +3,7 @@ package pool
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strconv"
 
 	"github.com/zzc53/zenofs/internal/db"
@@ -104,6 +105,27 @@ func (p *PoolManager) AddDisk(poolId int64, path string, diskBackend int8, diskT
 		return nil, errs.New(errs.ECODE_DISK_BAD_TYPE, errs.ESTR_DISK_BAD_TYPE, "invalid disk type", fmt.Sprintf("%d", diskType))
 	}
 
+	// 路径必须是绝对的、非空的：相对路径会随进程工作目录漂移，
+	// 空路径则会得到一块"看起来加上了、其实写不进去"的盘。
+	if path == "" {
+		return nil, errs.New(errs.ECODE_DISK_BAD_PATH, errs.ESTR_DISK_BAD_PATH,
+			"disk path is required", fmt.Sprintf("%d", poolId))
+	}
+	if !filepath.IsAbs(path) {
+		return nil, errs.New(errs.ECODE_DISK_BAD_PATH, errs.ESTR_DISK_BAD_PATH,
+			"disk path must be absolute", path)
+	}
+	// 同一个目录只能当一块盘使。path 上有唯一约束，这里提前给出可读的错误，
+	// 而不是把底层的 "UNIQUE constraint failed" 抛给调用方。
+	var reused int64
+	if err := p.DbManager.DB.Model(&db.Disk{}).Where("path = ?", path).Count(&reused).Error; err != nil {
+		return nil, errs.DBQuery(err)
+	}
+	if reused > 0 {
+		return nil, errs.New(errs.ECODE_DISK_EXIST, errs.ESTR_DISK_EXIST,
+			"this path is already used by a disk", path)
+	}
+
 	var disk db.Disk
 
 	// Cache 盘只需要一条记录，不参与条带化。
@@ -138,7 +160,7 @@ func (p *PoolManager) AddDisk(poolId int64, path string, diskBackend int8, diskT
 	var chunkType db.ChunkType
 	var idx int64 // new chunk's index (= old shard count)
 
-	err := p.DbManager.DB.Transaction(func(tx *gorm.DB) error {
+	err := p.DbManager.Tx(func(tx *gorm.DB) error {
 		var existingPool db.Pool
 		if err1 := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).Where("id = ?", poolId).First(&existingPool).Error; err1 != nil {
 			return errs.DBQuery(err1)
@@ -241,7 +263,7 @@ func (p *PoolManager) DeleteCacheDisk(diskId int64) (int, error) {
 	// 残留文件不影响正确性——盘记录没了就不会再被引用。
 	p.deleteCacheFiles(entries)
 
-	if err := p.DbManager.DB.Transaction(func(tx *gorm.DB) error {
+	if err := p.DbManager.Tx(func(tx *gorm.DB) error {
 		if err := tx.Where("disk_id = ?", diskId).Delete(&db.ReadCache{}).Error; err != nil {
 			return errs.DBQuery(err)
 		}
@@ -265,7 +287,7 @@ func (p *PoolManager) OfflinePool(poolId int64) error {
 // 并把所属 pool 置为 Offline——换盘后条带数据不完整，池在重建完成前不应对外服务。
 // 重建完成后由 recoverAfterRebuild 自动恢复 Online。
 func (p *PoolManager) SwapDisk(diskId int64, newPath string) error {
-	return p.DbManager.DB.Transaction(func(tx *gorm.DB) error {
+	return p.DbManager.Tx(func(tx *gorm.DB) error {
 		var disk db.Disk
 		if err := tx.First(&disk, diskId).Error; err != nil {
 			return errs.DBQuery(err)
