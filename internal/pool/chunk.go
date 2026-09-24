@@ -9,7 +9,6 @@ import (
 	"time"
 
 	cryptorand "crypto/rand"
-
 	mrand "math/rand"
 
 	"github.com/zeebo/blake3"
@@ -18,6 +17,11 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
+
+type ChunkData struct {
+	db.Chunk
+	Data []byte
+}
 
 // ---------------------------------------------------------------
 // 工具函数
@@ -49,46 +53,8 @@ func cryptoRandSeed() int64 {
 	return int64(binary.LittleEndian.Uint64(buf[:]))
 }
 
-// AddChunk 兼容包装：单 chunk 写入。
-// 委托给 AddChunks 处理，返回第一个（也是唯一一个）chunk。
-func (p *PoolManager) AddChunk(poolId int64, bytes []byte) (*db.Chunk, error) {
-	chunks, err := p.AddChunks(poolId, [][]byte{bytes})
-	if err != nil {
-		return nil, err
-	}
-	return &chunks[0], nil
-}
-
-// AddChunks 批量写入 chunks，支持任意数量（1 ≤ N）。
-//
-// 分配策略（三个 Phase 在同一事务中执行）：
-//
-//	Phase 1 — 消费预分配的 Reserved chunks
-//	  查询当前 pool 中状态为 Reserved 的 data chunk slot（加 SKIP LOCKED），
-//	  尽量复用已有的预留槽位，减少 stripe 碎片。
-//
-//	Phase 2 — 不够则建新 stripe
-//	  如果 Phase 1 不够用，创建新的 stripe 和对应的 chunk 行。
-//	  新 chunk 创建时直接写完成数据（status=Pending），无需 Phase 3 二次更新。
-//	  磁盘分配通过 shuffle 实现负载均衡。
-//
-//	Phase 3 — 激活 old Reserved chunks
-//	  对 Phase 1 获取的 old reserved chunks，更新 size/checksum/path 并标记 Pending。
-//
-// 事务提交后，事务外并发将实际数据写入磁盘。
-// 写入成功后标记 chunk 为 Dirty 并入队 WriteQueue，由 parity worker 异步计算 RS 校验。
-func (p *PoolManager) AddChunks(poolId int64, dataList [][]byte) ([]db.Chunk, error) {
-	// ---------------------------------------------------------------
-	// 前置校验：输入不能为空
-	// ---------------------------------------------------------------
-	if len(dataList) == 0 {
-		return nil, errs.New(errs.ECODE_CHUNK_EMPTY, errs.ESTR_CHUNK_EMPTY, "empty data list", "")
-	}
-	for i, data := range dataList {
-		if len(data) == 0 {
-			return nil, errs.New(errs.ECODE_CHUNK_EMPTY, errs.ESTR_CHUNK_EMPTY, "empty data", strconv.Itoa(i))
-		}
-	}
+func (p *PoolManager) getNewChunks(poolId int64, items []ChunkData) ([]db.Chunk, error) {
+	N := len(items)
 
 	// ---------------------------------------------------------------
 	// 校验 pool 是否存在且在线
@@ -101,26 +67,15 @@ func (p *PoolManager) AddChunks(poolId int64, dataList [][]byte) ([]db.Chunk, er
 		return nil, errs.New(errs.ECODE_POOL_OFFLINE, errs.ESTR_POOL_OFFLINE, "pool is offline", strconv.FormatInt(poolId, 10))
 	}
 
-	N := len(dataList)
+	var chunks []db.Chunk
 
 	// ---------------------------------------------------------------
-	// 预计算每个 chunk 的 BLAKE3 哈希和大小（在事务外计算）。
-	// 这样事务内部只需读写 DB，不占用大量内存。
+	// 查询 pool 中所有在线的 data 盘，Phase 2 建新 stripe 时会用到。
 	// ---------------------------------------------------------------
-	type ChunkData struct {
-		db.Chunk
-		Data []byte
-	}
-	items := make([]ChunkData, N)
-	for i, data := range dataList {
-		hash := blake3.Sum256(data)
-		items[i] = ChunkData{
-			Data: data,
-			Chunk: db.Chunk{
-				Hash: hash[:],
-				Size: int64(len(data)),
-			},
-		}
+	var disks []db.Disk
+	if err := p.DbManager.DB.Where("pool_id = ? AND status = ? AND type = ?",
+		poolId, db.Online, db.DataDisk).Find(&disks).Error; err != nil {
+		return nil, errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
 	}
 
 	// ---------------------------------------------------------------
@@ -133,21 +88,6 @@ func (p *PoolManager) AddChunks(poolId int64, dataList [][]byte) ([]db.Chunk, er
 				"chunk exceeds pool chunk size", strconv.FormatInt(maxSize, 10))
 		}
 	}
-
-	// ---------------------------------------------------------------
-	// 预加载该 pool 下所有磁盘信息（事务外），
-	// 后续文件写入时需要根据 disk.Backend 匹配对应的 Writer。
-	// ---------------------------------------------------------------
-	var allDisks []db.Disk
-	if err := p.DbManager.DB.Where("pool_id = ?", poolId).Find(&allDisks).Error; err != nil {
-		return nil, errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
-	}
-	diskById := make(map[int64]db.Disk, len(allDisks))
-	for i := range allDisks {
-		diskById[allDisks[i].Id] = allDisks[i]
-	}
-
-	var chunks []db.Chunk
 
 	// ---------------------------------------------------------------
 	// 以下三个 Phase 在同一个事务中执行，保证分配的原子性。
@@ -169,15 +109,6 @@ func (p *PoolManager) AddChunks(poolId int64, dataList [][]byte) ([]db.Chunk, er
 		}
 
 		need := N - len(reserved)
-
-		// ---------------------------------------------------------------
-		// 查询 pool 中所有在线的 data 盘，Phase 2 建新 stripe 时会用到。
-		// ---------------------------------------------------------------
-		var disks []db.Disk
-		if err := tx.Where("pool_id = ? AND status = ? AND type = ?",
-			poolId, db.Online, db.DataDisk).Find(&disks).Error; err != nil {
-			return errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
-		}
 
 		// ---------------------------------------------------------------
 		// Phase 2: 如果 Phase 1 不够用，新建 stripe。
@@ -239,7 +170,7 @@ func (p *PoolManager) AddChunks(poolId int64, dataList [][]byte) ([]db.Chunk, er
 						size = int64(items[itemIdx].Size)
 						hash = items[itemIdx].Hash[:]
 					}
-					p, err := generateChunkPath()
+					p, err := generateChunkPaths(1)
 					if err != nil {
 						return errs.FromError(err, errs.ECODE_CRYPTO_ERROR, errs.ESTR_CRYPTO_ERROR)
 					}
@@ -249,7 +180,7 @@ func (p *PoolManager) AddChunks(poolId int64, dataList [][]byte) ([]db.Chunk, er
 					}
 					allChunks[i] = db.Chunk{
 						Status:   status,
-						Path:     p,
+						Path:     p[0],
 						DiskId:   shuffled[i].Id,
 						StripeId: stripe.Id,
 						PoolId:   stripe.PoolId,
@@ -280,15 +211,8 @@ func (p *PoolManager) AddChunks(poolId int64, dataList [][]byte) ([]db.Chunk, er
 		// ---------------------------------------------------------------
 		for i := range reserved {
 			reserved[i].Status = db.ChunkAllocated
-			reserved[i].Size = int64(items[i].Size)
-			reserved[i].Hash = items[i].Hash[:]
-			if reserved[i].Path == "" {
-				p, err := generateChunkPath()
-				if err != nil {
-					return errs.FromError(err, errs.ECODE_CRYPTO_ERROR, errs.ESTR_CRYPTO_ERROR)
-				}
-				reserved[i].Path = p
-			}
+			reserved[i].Size = items[i].Size
+			reserved[i].Hash = items[i].Hash
 			if err := tx.Save(&reserved[i]).Error; err != nil {
 				return errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
 			}
@@ -303,6 +227,77 @@ func (p *PoolManager) AddChunks(poolId int64, dataList [][]byte) ([]db.Chunk, er
 	if err != nil {
 		return nil, err
 	}
+	return chunks, nil
+}
+
+// AddChunk 兼容包装：单 chunk 写入。
+// 委托给 AddChunks 处理，返回第一个（也是唯一一个）chunk。
+func (p *PoolManager) AddChunk(poolId int64, bytes []byte) (*db.Chunk, error) {
+	chunks, err := p.AddChunks(poolId, [][]byte{bytes})
+	if err != nil {
+		return nil, err
+	}
+	return &chunks[0], nil
+}
+
+// AddChunks 批量写入 chunks，支持任意数量（1 ≤ N）。
+//
+// 分配策略（三个 Phase 在同一事务中执行）：
+//
+//	Phase 1 — 消费预分配的 Reserved chunks
+//	  查询当前 pool 中状态为 Reserved 的 data chunk slot（加 SKIP LOCKED），
+//	  尽量复用已有的预留槽位，减少 stripe 碎片。
+//
+//	Phase 2 — 不够则建新 stripe
+//	  如果 Phase 1 不够用，创建新的 stripe 和对应的 chunk 行。
+//	  新 chunk 创建时直接写完成数据（status=Pending），无需 Phase 3 二次更新。
+//	  磁盘分配通过 shuffle 实现负载均衡。
+//
+//	Phase 3 — 激活 old Reserved chunks
+//	  对 Phase 1 获取的 old reserved chunks，更新 size/checksum/path 并标记 Pending。
+//
+// 事务提交后，事务外并发将实际数据写入磁盘。
+// 写入成功后标记 chunk 为 Dirty 并入队 WriteQueue，由 parity worker 异步计算 RS 校验。
+func (p *PoolManager) AddChunks(poolId int64, dataList [][]byte) ([]db.Chunk, error) {
+	// ---------------------------------------------------------------
+	// 前置校验：输入不能为空
+	// ---------------------------------------------------------------
+	if len(dataList) == 0 {
+		return nil, errs.New(errs.ECODE_CHUNK_EMPTY, errs.ESTR_CHUNK_EMPTY, "empty data list", "")
+	}
+	for i, data := range dataList {
+		if len(data) == 0 {
+			return nil, errs.New(errs.ECODE_CHUNK_EMPTY, errs.ESTR_CHUNK_EMPTY, "empty data", strconv.Itoa(i))
+		}
+	}
+
+	N := len(dataList)
+	// ---------------------------------------------------------------
+	// 预计算每个 chunk 的 BLAKE3 哈希和大小（在事务外计算）。
+	// 这样事务内部只需读写 DB，不占用大量内存。
+	// ---------------------------------------------------------------
+	items := make([]ChunkData, N)
+	for i, data := range dataList {
+		hash := blake3.Sum256(data)
+		items[i] = ChunkData{
+			Data: data,
+			Chunk: db.Chunk{
+				Hash: hash[:],
+				Size: int64(len(data)),
+			},
+		}
+	}
+
+	// ---------------------------------------------------------------
+	// 预加载该 pool 下所有磁盘信息（事务外），
+	// 后续文件写入时需要根据 disk.Backend 匹配对应的 Writer。
+	// ---------------------------------------------------------------
+	diskById, err := p.getDiskMapByPoolId(poolId)
+	if err != nil {
+		return nil, err
+	}
+
+	chunks, err := p.getNewChunks(poolId, items)
 
 	// ---------------------------------------------------------------
 	// 事务提交后，并发将实际数据写入磁盘。
@@ -397,17 +392,21 @@ func (p *PoolManager) AddChunks(poolId int64, dataList [][]byte) ([]db.Chunk, er
 	return chunks, nil
 }
 
-// generateChunkPath 生成 chunk 文件在磁盘上的相对路径。
+// generateChunkPaths 生成 chunk 文件在磁盘上的相对路径。
 // 按时分秒分层目录组织，末尾加 8 位随机字符串防冲突。
 // 格式: YYYY/MM/DD/HH/MM/<random8>
-func generateChunkPath() (string, error) {
+func generateChunkPaths(count int) ([]string, error) {
 	dateStr := time.Now().Format("2006/01/02/15/04")
-	randomStr, err := generateSecureRandomString(11)
-	if err != nil {
-		return "", err
+	stringArr := make([]string, count)
+	for i := range stringArr {
+		randomStr, err := generateSecureRandomString(11)
+		if err != nil {
+			return nil, err
+		}
+		suffix := randomStr[0:8] + "." + randomStr[8:10]
+		stringArr[i] = path.Join(dateStr, suffix)
 	}
-	suffix := randomStr[0:8] + "." + randomStr[8:10]
-	return path.Join(dateStr, suffix), nil
+	return stringArr, nil
 }
 
 // WriteChunkItem 指定待写入的 chunk ID 和对应的数据。
@@ -464,8 +463,7 @@ func (p *PoolManager) WriteChunks(items []WriteChunkItem) ([]db.Chunk, error) {
 		chunkIds[i] = it.chunkId
 	}
 	var chunks []db.Chunk
-	if err := p.DbManager.DB.Joins("JOIN stripes ON chunks.stripe_id = stripes.id").
-		Where("chunks.id IN ?", chunkIds).Find(&chunks).Error; err != nil {
+	if err := p.DbManager.DB.Where("id IN ?", chunkIds).Find(&chunks).Error; err != nil {
 		return nil, errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
 	}
 	if len(chunks) != N {
@@ -510,13 +508,9 @@ func (p *PoolManager) WriteChunks(items []WriteChunkItem) ([]db.Chunk, error) {
 	}
 
 	// 预加载盘信息（写文件用）
-	var allDisks []db.Disk
-	if err := p.DbManager.DB.Where("pool_id = ?", poolId).Find(&allDisks).Error; err != nil {
-		return nil, errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
-	}
-	diskById := make(map[int64]db.Disk, len(allDisks))
-	for i := range allDisks {
-		diskById[allDisks[i].Id] = allDisks[i]
+	diskById, err := p.getDiskMapByPoolId(poolId)
+	if err != nil {
+		return nil, err
 	}
 
 	// ---------------------------------------------------------------
@@ -527,13 +521,6 @@ func (p *PoolManager) WriteChunks(items []WriteChunkItem) ([]db.Chunk, error) {
 			ordered[i].Status = db.ChunkAllocated
 			ordered[i].Size = int64(prep[i].size)
 			ordered[i].Hash = prep[i].hash[:]
-			if ordered[i].Path == "" {
-				p, err := generateChunkPath()
-				if err != nil {
-					return errs.FromError(err, errs.ECODE_CRYPTO_ERROR, errs.ESTR_CRYPTO_ERROR)
-				}
-				ordered[i].Path = p
-			}
 		}
 		return tx.Save(&ordered).Error
 	})
@@ -656,8 +643,7 @@ func (p *PoolManager) ReadChunks(poolId int64, chunkIds []int64) ([][]byte, erro
 
 	// 一次查出所有 chunk，验证属于该 pool
 	var chunks []db.Chunk
-	if err := p.DbManager.DB.Joins("JOIN stripes ON chunks.stripe_id = stripes.id").
-		Where("chunks.id IN ? AND stripes.pool_id = ?", chunkIds, poolId).
+	if err := p.DbManager.DB.Where("id IN ? AND pool_id = ?", chunkIds, poolId).
 		Find(&chunks).Error; err != nil {
 		return nil, errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
 	}
@@ -677,15 +663,10 @@ func (p *PoolManager) ReadChunks(poolId int64, chunkIds []int64) ([][]byte, erro
 	}
 
 	// 预加载盘信息
-	var allDisks []db.Disk
-	if err := p.DbManager.DB.Where("pool_id = ?", poolId).Find(&allDisks).Error; err != nil {
-		return nil, errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
+	diskById, err := p.getDiskMapByPoolId(poolId)
+	if err != nil {
+		return nil, err
 	}
-	diskById := make(map[int64]db.Disk, len(allDisks))
-	for i := range allDisks {
-		diskById[allDisks[i].Id] = allDisks[i]
-	}
-
 	// ---------------------------------------------------------------
 	// 并发读取（优先走缓存，未命中则从源盘读取并异步写入缓存盘）
 	// ---------------------------------------------------------------

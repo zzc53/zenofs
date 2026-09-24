@@ -4,11 +4,10 @@ import (
 	"fmt"
 	"strconv"
 
+	"github.com/zzc53/zenofs/internal/db"
 	"github.com/zzc53/zenofs/internal/errs"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
-
-	"github.com/zzc53/zenofs/internal/db"
 )
 
 // PoolManager 管理存储池、磁盘、chunk 的元数据和操作。
@@ -145,14 +144,14 @@ func (p *PoolManager) AddDisk(poolId int64, path string, diskBackend int8, diskT
 	}
 	if len(stripes) > 0 {
 		allocs := make([]db.Chunk, len(stripes))
+		paths, err2 := generateChunkPaths(len(stripes))
+		if err2 != nil {
+			return nil, errs.FromError(err2, errs.ECODE_CRYPTO_ERROR, errs.ESTR_CRYPTO_ERROR)
+		}
 		for i, s := range stripes {
-			p, err2 := generateChunkPath()
-			if err2 != nil {
-				return nil, errs.FromError(err2, errs.ECODE_CRYPTO_ERROR, errs.ESTR_CRYPTO_ERROR)
-			}
 			allocs[i] = db.Chunk{
 				Status:   db.ChunkReserved,
-				Path:     p,
+				Path:     paths[i],
 				DiskId:   disk.Id,
 				StripeId: s.Id,
 				Type:     chunkType,
@@ -184,4 +183,17 @@ func (p *PoolManager) SwapDisk(diskId int64, newPath string) error {
 		}
 		return nil
 	})
+}
+
+func (p *PoolManager) getDiskMapByPoolId(poolId int64) (map[int64]db.Disk, error) {
+	// 预加载盘信息（写文件用）
+	var allDisks []db.Disk
+	if err := p.DbManager.DB.Where("pool_id = ?", poolId).Find(&allDisks).Error; err != nil {
+		return nil, errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
+	}
+	diskById := make(map[int64]db.Disk, len(allDisks))
+	for i := range allDisks {
+		diskById[allDisks[i].Id] = allDisks[i]
+	}
+	return diskById, nil
 }
