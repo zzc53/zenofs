@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 
@@ -15,6 +16,8 @@ type ChunkHandler interface {
 	Write(disk db.Disk, relPath string, data []byte) error
 	// Read 完整读取 relPath 文件的全部内容。
 	Read(disk db.Disk, relPath string) ([]byte, error)
+	// Delete 删除 relPath 对应的文件；文件本就不存在时返回 nil。
+	Delete(disk db.Disk, relPath string) error
 }
 
 // LocalChunkHandler 基于本地文件系统实现 ChunkHandler。
@@ -40,4 +43,13 @@ func (w *LocalChunkHandler) Write(disk db.Disk, relPath string, data []byte) err
 // Read 完整读取文件内容返回。
 func (w *LocalChunkHandler) Read(disk db.Disk, relPath string) ([]byte, error) {
 	return os.ReadFile(filepath.Join(disk.Path, relPath))
+}
+
+// Delete 删除文件；文件本就不存在时视为成功。
+func (w *LocalChunkHandler) Delete(disk db.Disk, relPath string) error {
+	err := os.Remove(filepath.Join(disk.Path, relPath))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
 }

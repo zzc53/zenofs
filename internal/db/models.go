@@ -121,16 +121,24 @@ type StripeQueue struct {
 	CreatedAt int64           `gorm:"autoCreateTime;index"`
 }
 
+type CacheStatus int8
+
+const (
+	NotCached = iota
+	Cached
+)
+
 // ReadCache 记录 chunk 在缓存盘上的副本。
 // 同一 chunk 最多有一条未过期的缓存记录。
 type ReadCache struct {
-	Id          int64  `gorm:"primaryKey"`
-	ChunkId     int64  `gorm:"uniqueIndex"` // 缓存哪个 chunk
-	Path        string // 缓存文件相对路径
-	DiskId      int64  `gorm:"index"` // 缓存所在磁盘
-	AccessCount int64  `gorm:"index"`
-	CreatedAt   int64  `gorm:"autoCreateTime;index"`
-	UpdatedAt   int64  `gorm:"autoUpdateTime;index"`
+	Id          int64       `gorm:"primaryKey"`
+	ChunkId     int64       `gorm:"uniqueIndex"` // 缓存哪个 chunk
+	Path        string      // 缓存文件相对路径
+	DiskId      int64       `gorm:"index"` // 缓存所在磁盘
+	AccessCount int64       `gorm:"index"`
+	Status      CacheStatus `gorm:"index"`
+	CreatedAt   int64       `gorm:"autoCreateTime;index"`
+	UpdatedAt   int64       `gorm:"autoUpdateTime;index"`
 }
 
 // Setting 存储全局 KV 配置（如 HTTP_PORT）。

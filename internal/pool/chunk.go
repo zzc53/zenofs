@@ -3,6 +3,7 @@ package pool
 import (
 	"encoding/binary"
 	"fmt"
+	"log"
 	"path"
 	"strconv"
 	"time"
@@ -561,6 +562,12 @@ func (p *PoolManager) WriteChunks(items []WriteChunkItem) ([]db.Chunk, error) {
 		return nil, err
 	}
 
+	// 数据即将被覆盖，先批量清除这批 chunk 的缓存（记录 + 缓存文件），
+	// 否则后续读会命中过期内容。
+	if err := p.dropCaches(chunkIds); err != nil {
+		return nil, err
+	}
+
 	// 批量更新 chunk 元数据（status / size / hash），一次 upsert 完成
 	for i := range ordered {
 		ordered[i].Status = db.ChunkAllocated
@@ -603,8 +610,9 @@ func (p *PoolManager) WriteChunks(items []WriteChunkItem) ([]db.Chunk, error) {
 //  1. 校验 pool 在线
 //  2. 一次查出所有 chunk 元数据，验证属于该 pool
 //  3. 按 chunkId 排序保持顺序
-//  4. 预加载磁盘信息
-//  5. 并发读取（优先尝试缓存，未命中则从源盘读取并异步缓存）
+//  4. 预加载磁盘信息，并批量取出这批 chunk 的缓存记录
+//  5. 并发读取：已落盘的缓存直接读缓存盘（读失败回退源盘），其余读源盘
+//  6. 按缓存策略批量维护访问计数 / 落盘（见 updateCacheAccess）
 func (p *PoolManager) ReadChunks(poolId int64, chunkIds []int64) ([][]byte, error) {
 	if len(chunkIds) == 0 {
 		return nil, errs.New(errs.ECODE_CHUNK_EMPTY, errs.ESTR_CHUNK_EMPTY, "empty chunk ids", "")
@@ -647,18 +655,27 @@ func (p *PoolManager) ReadChunks(poolId int64, chunkIds []int64) ([][]byte, erro
 	if err != nil {
 		return nil, err
 	}
+
+	// 一次取出这批 chunk 的缓存记录（含缓存盘的 Disk 信息，已在上面的 diskById 里）
+	caches := p.loadCaches(chunkIds)
+
 	// ---------------------------------------------------------------
-	// 并发读取（优先走缓存，未命中则从源盘读取并异步写入缓存盘）
+	// 并发读取：已落盘的缓存直接读缓存盘，其余读源盘
 	// ---------------------------------------------------------------
 	results := make([][]byte, N)
 	readErrs := parallelEach(N, 0, func(i int) error {
 		c := ordered[i]
-		// 先尝试从缓存读取（如果 pool 配置了缓存盘）
-		if cached, _ := p.tryReadCache(c.Id); cached != nil {
-			results[i] = cached
-			return nil
+		// 缓存命中：状态为 Cached 说明文件已经落盘
+		if entry, ok := caches[c.Id]; ok && entry.Status == db.Cached {
+			cached, err := p.readCacheFile(entry, diskById)
+			if err == nil {
+				results[i] = cached
+				return nil
+			}
+			// 缓存文件读失败，回退源盘
+			log.Printf("cache: read chunk %d from cache failed, fallback to disk: %v", c.Id, err)
 		}
-		// 缓存未命中，从源盘读取
+		// 从源盘读取
 		disk := diskById[c.DiskId]
 		h := p.handlerFor(disk.Backend)
 		if h == nil {
@@ -669,13 +686,15 @@ func (p *PoolManager) ReadChunks(poolId int64, chunkIds []int64) ([][]byte, erro
 		if err != nil {
 			return errs.FromError(err, errs.ECODE_FILE_WRITE, errs.ESTR_FILE_WRITE)
 		}
-		// 异步将数据写入缓存盘
-		go p.writeCache(poolId, c.Id, data)
 		results[i] = data
 		return nil
 	})
 	if err := firstErr(readErrs); err != nil {
 		return nil, err
 	}
+
+	// 批量维护缓存状态：未达阈值的累加计数，达到阈值的落盘（见 updateCacheAccess）
+	p.updateCacheAccess(poolId, ordered, results, caches)
+
 	return results, nil
 }
