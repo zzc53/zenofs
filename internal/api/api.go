@@ -182,40 +182,6 @@ func NewRouter(pm *pool.PoolManager) *chi.Mux {
 			}
 			respondJSON(w, http.StatusOK, chunks[0])
 		})
-
-		// ── Chunk Partial Read/Write ──
-		// GET /api/chunks/{id}/range?offset=N&length=M  部分读取
-		r.Get("/chunks/{id}/range", func(w http.ResponseWriter, r *http.Request) {
-			id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-			offset, _ := strconv.ParseInt(r.URL.Query().Get("offset"), 10, 64)
-			length, _ := strconv.ParseInt(r.URL.Query().Get("length"), 10, 64)
-			if length <= 0 {
-				respondJSON(w, http.StatusBadRequest, apiError{Message: "invalid length"})
-				return
-			}
-			data, err := pm.ReadChunkPartial(id, offset, length)
-			if err != nil {
-				respondErr(w, err)
-				return
-			}
-			w.Write(data)
-		})
-
-		// PUT /api/chunks/{id}/range?offset=N  部分覆写
-		r.Put("/chunks/{id}/range", func(w http.ResponseWriter, r *http.Request) {
-			id, _ := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-			offset, _ := strconv.ParseInt(r.URL.Query().Get("offset"), 10, 64)
-			data, err := io.ReadAll(r.Body)
-			if err != nil {
-				respondJSON(w, http.StatusBadRequest, apiError{Message: "read body failed"})
-				return
-			}
-			if err := pm.WriteChunkPartial(id, offset, data); err != nil {
-				respondErr(w, err)
-				return
-			}
-			respondJSON(w, http.StatusOK, map[string]string{"status": "written"})
-		})
 	})
 
 	return r

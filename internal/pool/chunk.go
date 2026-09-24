@@ -402,10 +402,11 @@ func (p *PoolManager) AddChunks(poolId int64, dataList [][]byte) ([]db.Chunk, er
 // 格式: YYYY/MM/DD/HH/MM/<random8>
 func generateChunkPath() (string, error) {
 	dateStr := time.Now().Format("2006/01/02/15/04")
-	suffix, err := generateSecureRandomString(8)
+	randomStr, err := generateSecureRandomString(11)
 	if err != nil {
 		return "", err
 	}
+	suffix := randomStr[0:8] + "." + randomStr[8:10]
 	return path.Join(dateStr, suffix), nil
 }
 
@@ -734,148 +735,4 @@ func (p *PoolManager) ReadChunks(poolId int64, chunkIds []int64) ([][]byte, erro
 		results[r.idx] = r.data
 	}
 	return results, nil
-}
-
-// ReadChunkPartial 从 chunk 的指定偏移读取指定长度的数据。
-//
-// 流程：
-//  1. 尝试从缓存读取全量数据，命中后直接从内存切取所需范围
-//  2. 缓存未命中则查询 chunk 元数据，推导 poolId 并校验 pool 在线
-//  3. 使用 handler.ReadAt 从磁盘读取指定偏移和长度的数据
-//  4. 后台异步从源盘读取全量数据并写入缓存盘（下次可直接走缓存）
-func (p *PoolManager) ReadChunkPartial(chunkId int64, offset int64, length int64) ([]byte, error) {
-	// 尝试从全量缓存读取，命中则直接从缓存数据中切取所需范围
-	if cached, _ := p.tryReadCache(chunkId); cached != nil {
-		end := offset + length
-		if end > int64(len(cached)) {
-			end = int64(len(cached))
-		}
-		if offset >= end {
-			return nil, errs.New(errs.ECODE_CHUNK_EMPTY, errs.ESTR_CHUNK_EMPTY, "offset beyond data", strconv.FormatInt(offset, 10))
-		}
-		return cached[offset:end], nil
-	}
-
-	var chunk db.Chunk
-	if err := p.DbManager.DB.First(&chunk, chunkId).Error; err != nil {
-		return nil, errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
-	}
-
-	// 推导 poolId 并校验 pool 在线
-	var stripe db.Stripe
-	if err := p.DbManager.DB.First(&stripe, chunk.StripeId).Error; err != nil {
-		return nil, errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
-	}
-	poolObj, err := p.GetPool(stripe.PoolId)
-	if err != nil {
-		return nil, err
-	}
-	if poolObj.Status != db.Online {
-		return nil, errs.New(errs.ECODE_POOL_OFFLINE, errs.ESTR_POOL_OFFLINE, "pool is offline", strconv.FormatInt(stripe.PoolId, 10))
-	}
-
-	var disk db.Disk
-	if err := p.DbManager.DB.First(&disk, chunk.DiskId).Error; err != nil {
-		return nil, errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
-	}
-
-	h := p.handlerFor(disk.Backend)
-	if h == nil {
-		return nil, errs.New(errs.ECODE_FILE_WRITE, errs.ESTR_FILE_WRITE, "no handler for backend", strconv.Itoa(int(disk.Backend)))
-	}
-
-	data, err := h.ReadAt(disk, chunk.Path, offset, length)
-	if err != nil {
-		return nil, errs.FromError(err, errs.ECODE_FILE_WRITE, errs.ESTR_FILE_WRITE)
-	}
-
-	// 后台异步读取全量数据并写入缓存盘（方便后续的读取命中缓存）
-	go func() {
-		full, err := h.Read(disk, chunk.Path)
-		if err == nil {
-			p.writeCache(stripe.PoolId, chunkId, full)
-		}
-	}()
-
-	return data, nil
-}
-
-// WriteChunkPartial 从指定偏移写入数据到 chunk。
-//
-// 流程：
-//  1. 参数校验（非空、不超过全局 64MB 上限）
-//  2. 查询 chunk 元数据，推导 poolId 并校验 pool 在线
-//  3. 使用 handler.WriteAt 部分覆写磁盘文件
-//  4. 读取写入后完整的 chunk 数据，重新计算 BLAKE3 checksum
-//  5. 更新 chunk 元数据（size、checksum），标记 Dirty
-//  6. 入队 WriteQueue，由 parity worker 异步全量 re-encode
-func (p *PoolManager) WriteChunkPartial(chunkId int64, offset int64, data []byte) error {
-	if len(data) == 0 {
-		return errs.New(errs.ECODE_CHUNK_EMPTY, errs.ESTR_CHUNK_EMPTY, "empty data", "")
-	}
-	if int64(len(data)) > maxChunkBytes {
-		return errs.New(errs.ECODE_CHUNK_SIZE_EXCEED, errs.ESTR_CHUNK_SIZE_EXCEED,
-			"write exceeds max chunk size", strconv.FormatInt(maxChunkBytes, 10))
-	}
-
-	var chunk db.Chunk
-	if err := p.DbManager.DB.First(&chunk, chunkId).Error; err != nil {
-		return errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
-	}
-
-	// 推导 poolId 并校验 pool 在线
-	var stripe db.Stripe
-	if err := p.DbManager.DB.First(&stripe, chunk.StripeId).Error; err != nil {
-		return errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
-	}
-	pool, err := p.GetPool(stripe.PoolId)
-	if err != nil {
-		return err
-	}
-	if pool.Status != db.Online {
-		return errs.New(errs.ECODE_POOL_OFFLINE, errs.ESTR_POOL_OFFLINE, "pool is offline", strconv.FormatInt(stripe.PoolId, 10))
-	}
-
-	var disk db.Disk
-	if err := p.DbManager.DB.First(&disk, chunk.DiskId).Error; err != nil {
-		return errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
-	}
-
-	h := p.handlerFor(disk.Backend)
-	if h == nil {
-		return errs.New(errs.ECODE_FILE_WRITE, errs.ESTR_FILE_WRITE, "no handler for backend", strconv.Itoa(int(disk.Backend)))
-	}
-
-	// 部分覆写磁盘文件
-	if err := h.WriteAt(disk, chunk.Path, offset, data); err != nil {
-		return errs.FromError(err, errs.ECODE_FILE_WRITE, errs.ESTR_FILE_WRITE)
-	}
-
-	// 重新读取完整数据计算 checksum（部分写入后原始 checksum 已失效）
-	fullData, err := h.Read(disk, chunk.Path)
-	if err != nil {
-		return errs.FromError(err, errs.ECODE_FILE_WRITE, errs.ESTR_FILE_WRITE)
-	}
-	newSize := int64(len(fullData))
-	hash := blake3.Sum256(fullData)
-
-	// 更新元数据：size、checksum、status（Dirty）、WriteQueue
-	if err := p.DbManager.DB.Model(&db.Chunk{}).Where("id = ?", chunkId).Updates(map[string]interface{}{
-		"status":   db.ChunkAllocated,
-		"size":     newSize,
-		"checksum": hash[:],
-	}).Error; err != nil {
-		return errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
-	}
-
-	// 入队 WriteQueue，通知 parity worker 计算 parity
-	wq := db.WriteQueue{
-		ChunkId:  chunkId,
-		StripeId: chunk.StripeId,
-	}
-	if err := p.DbManager.DB.Create(&wq).Error; err != nil {
-		return errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
-	}
-
-	return nil
 }
