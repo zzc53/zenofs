@@ -436,22 +436,19 @@ func (p *PoolManager) WriteChunks(items []WriteChunkItem) ([]db.Chunk, error) {
 	N := len(items)
 
 	// 预计算每个 chunk 的 hash 和 size
-	type prepared struct {
-		chunkId int64
-		data    []byte
-		hash    [32]byte
-		size    int
-	}
-	prep := make([]prepared, N)
+	prep := make([]ChunkData, N)
 	for i, it := range items {
 		if len(it.Data) == 0 {
 			return nil, errs.New(errs.ECODE_CHUNK_EMPTY, errs.ESTR_CHUNK_EMPTY, "empty data", strconv.Itoa(i))
 		}
-		prep[i] = prepared{
-			chunkId: it.ChunkId,
-			data:    it.Data,
-			hash:    blake3.Sum256(it.Data),
-			size:    len(it.Data),
+		hash := blake3.Sum256(it.Data)
+		prep[i] = ChunkData{
+			Data: it.Data,
+			Chunk: db.Chunk{
+				Id:   it.ChunkId,
+				Hash: hash[:],
+				Size: int64(len(it.Data)),
+			},
 		}
 	}
 
@@ -460,7 +457,7 @@ func (p *PoolManager) WriteChunks(items []WriteChunkItem) ([]db.Chunk, error) {
 	// ---------------------------------------------------------------
 	chunkIds := make([]int64, N)
 	for i, it := range prep {
-		chunkIds[i] = it.chunkId
+		chunkIds[i] = it.Chunk.Id
 	}
 	var chunks []db.Chunk
 	if err := p.DbManager.DB.Where("id IN ?", chunkIds).Find(&chunks).Error; err != nil {
@@ -491,7 +488,7 @@ func (p *PoolManager) WriteChunks(items []WriteChunkItem) ([]db.Chunk, error) {
 	// 校验数据大小不超过 pool 的 chunk size
 	maxSize := pool.ChunkSize * 1024
 	for _, it := range prep {
-		if int64(it.size) > maxSize {
+		if int64(it.Size) > maxSize {
 			return nil, errs.New(errs.ECODE_CHUNK_SIZE_EXCEED, errs.ESTR_CHUNK_SIZE_EXCEED,
 				"data exceeds pool chunk size", strconv.FormatInt(maxSize, 10))
 		}
@@ -504,7 +501,7 @@ func (p *PoolManager) WriteChunks(items []WriteChunkItem) ([]db.Chunk, error) {
 	}
 	ordered := make([]db.Chunk, N)
 	for i, it := range prep {
-		ordered[i] = *chunkById[it.chunkId]
+		ordered[i] = *chunkById[it.Id]
 	}
 
 	// 预加载盘信息（写文件用）
@@ -519,8 +516,8 @@ func (p *PoolManager) WriteChunks(items []WriteChunkItem) ([]db.Chunk, error) {
 	err = p.DbManager.DB.Transaction(func(tx *gorm.DB) error {
 		for i := range ordered {
 			ordered[i].Status = db.ChunkAllocated
-			ordered[i].Size = int64(prep[i].size)
-			ordered[i].Hash = prep[i].hash[:]
+			ordered[i].Size = int64(prep[i].Size)
+			ordered[i].Hash = prep[i].Hash
 		}
 		return tx.Save(&ordered).Error
 	})
@@ -550,7 +547,7 @@ func (p *PoolManager) WriteChunks(items []WriteChunkItem) ([]db.Chunk, error) {
 			if err := h.Write(disk, relPath, data); err != nil {
 				resultCh <- writeResult{idx, errs.FromError(err, errs.ECODE_FILE_WRITE, errs.ESTR_FILE_WRITE)}
 			}
-		}(i, diskById[ordered[i].DiskId], ordered[i].Path, prep[i].data)
+		}(i, diskById[ordered[i].DiskId], ordered[i].Path, prep[i].Data)
 	}
 	wg.Wait()
 	close(resultCh)

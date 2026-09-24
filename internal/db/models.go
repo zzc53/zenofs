@@ -97,10 +97,11 @@ type Chunk struct {
 // WriteQueue 是 write 计算的任务队列。
 // 当 data chunk 写入或更新时入队，parity worker 出队后计算 RS parity。
 type WriteQueue struct {
-	Id        int64 `gorm:"primaryKey"`
-	ChunkId   int64 `gorm:"index"`
-	StripeId  int64 `gorm:"index"`
-	CreatedAt int64 `gorm:"autoCreateTime;index"`
+	Id        int64      `gorm:"primaryKey"`
+	ChunkId   int64      `gorm:"index"`
+	StripeId  int64      `gorm:"index"`
+	Status    TaskStatus `gorm:"index"`
+	CreatedAt int64      `gorm:"autoCreateTime;index"`
 }
 
 type StripeQueueType int8
@@ -145,9 +146,10 @@ type Setting struct {
 type TaskStatus int8
 
 const (
-	TaskPending  TaskStatus = iota // 0 — 等待执行
-	TaskRunning                    // 1 — 正在运行
-	TaskFinished                   // 2 — 已完成
+	TaskPending TaskStatus = iota // 0 — 等待执行
+	TaskRunning                   // 1 — 正在运行
+	TaskSuccess                   // 2 — 成功
+	TaskFail                      // 3 - 失败
 )
 
 // Task 记录后台任务的执行历史。
@@ -251,24 +253,25 @@ type Inode struct {
 // Version 是文件的一个快照版本。
 // 同一文件的版本号递增，支持回滚和版本管理。
 type Version struct {
-	Id        int64  `gorm:"primaryKey;autoIncrement"`
-	InodeId   int64  `gorm:"uniqueIndex:idx_ver_inode_num,priority:1;not null"`
-	Size      int64  `gorm:"default:0"` // 文件总大小
-	Hash      string // 文件级哈希（所有 chunk 拼接后）
-	CreatedBy int64  `gorm:"index"` // 创建用户ID
-	CreatedAt int64  `gorm:"autoCreateTime"`
+	Id          int64         `gorm:"primaryKey;autoIncrement"`
+	InodeId     int64         `gorm:"uniqueIndex:idx_ver_inode_num,priority:1;not null"`
+	ParentId    sql.NullInt64 `gorm:"index"`
+	Size        int64         `gorm:"default:0"` // 文件总大小
+	Hash        string        // 文件级哈希（所有 chunk 拼接后）
+	Encryption  int8          `gorm:"default:0"`
+	Compression int8          `gorm:"default:0"`
+	CreatedBy   int64         `gorm:"index"` // 创建用户ID
+	CreatedAt   int64         `gorm:"autoCreateTime"`
 }
 
 // VersionChunk 将文件版本的逻辑切片映射到存储层的 chunk。
 // idx 表示切片在文件中的顺序，读取时按 idx 排序拼接。
 type VersionChunk struct {
-	VersionId   int64  `gorm:"primaryKey"`
-	Idx         int64  `gorm:"primaryKey"`     // 切片序号
-	ChunkId     int64  `gorm:"index;not null"` // 对应的存储层 chunk
-	Size        int64  `gorm:"not null"`       // 切片大小
-	Hash        []byte `gorm:"not null"`       // 切片级哈希
-	Encryption  int8   `gorm:"default:0"`
-	Compression int8   `gorm:"default:0"`
+	VersionId int64  `gorm:"primaryKey"`
+	Idx       int64  `gorm:"primaryKey"`     // 切片序号
+	ChunkId   int64  `gorm:"index;not null"` // 对应的存储层 chunk
+	Size      int64  `gorm:"not null"`       // 切片大小
+	Hash      []byte `gorm:"not null"`       // 切片级哈希
 }
 
 // InodeHistory 记录 inode 的元数据变更事件（创建/改名/移动/删除）。
