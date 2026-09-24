@@ -216,14 +216,6 @@ func NewRouter(pm *pool.PoolManager) *chi.Mux {
 			}
 			respondJSON(w, http.StatusOK, map[string]string{"status": "written"})
 		})
-
-		// ── Repair ──
-		// POST /api/pools/{poolId}/reconstruct  异步触发 stripe 重建
-		r.Post("/pools/{poolId}/reconstruct", func(w http.ResponseWriter, r *http.Request) {
-			poolId, _ := strconv.ParseInt(chi.URLParam(r, "poolId"), 10, 64)
-			go pm.ReconstructStripes(poolId)
-			respondJSON(w, http.StatusOK, map[string]string{"status": "task started"})
-		})
 	})
 
 	return r

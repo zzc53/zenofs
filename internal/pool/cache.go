@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	cacheTTL          = 1 * time.Hour
+	cacheTTL           = 1 * time.Hour
 	cacheCleanInterval = 60 * time.Second
 )
 
@@ -41,13 +41,13 @@ func cachePath(chunkId int64) string {
 // 返回 nil, nil 表示缓存未命中。
 func (p *PoolManager) tryReadCache(chunkId int64) ([]byte, error) {
 	var entry db.ReadCache
-	if err := p.DbManager.DB.Where("chunk_id = ? AND expired_at > ?", chunkId, time.Now().Unix()).First(&entry).Error; err != nil {
-		return nil, nil // 缓存未命中
+	if err := p.DbManager.DB.Where("chunk_id = ?", chunkId, time.Now().Unix()).First(&entry).Error; err != nil {
+		return nil, err // 缓存未命中
 	}
 
 	var disk db.Disk
 	if err := p.DbManager.DB.First(&disk, entry.DiskId).Error; err != nil {
-		return nil, nil
+		return nil, err
 	}
 
 	h := p.handlerFor(disk.Backend)
@@ -88,13 +88,11 @@ func (p *PoolManager) writeCache(poolId int64, chunkId int64, data []byte) {
 	}
 
 	// 写入或更新缓存记录
-	now := time.Now().Unix()
 	p.DbManager.DB.Where("chunk_id = ?", chunkId).Delete(&db.ReadCache{})
 	if err := p.DbManager.DB.Create(&db.ReadCache{
-		ChunkId:   chunkId,
-		Path:      relPath,
-		DiskId:    cacheDisk.Id,
-		ExpiredAt: now + int64(cacheTTL.Seconds()),
+		ChunkId: chunkId,
+		Path:    relPath,
+		DiskId:  cacheDisk.Id,
 	}).Error; err != nil {
 		log.Printf("cache: record chunk %d failed: %v", chunkId, err)
 	}

@@ -38,12 +38,12 @@ const (
 
 // Disk 表示存储池中的一块物理/逻辑盘。
 type Disk struct {
-	Id      int64  `gorm:"primaryKey"`
-	Path    string `gorm:"uniqueIndex"`                                           // 盘路径（本地目录 / S3 bucket）
-	PoolId  int64  `gorm:"index:idx_disk_pool_status_type,priority:1"`            // 所属存储池
-	Backend DiskBackend                                                           // 后端类型
-	Type    DiskType       `gorm:"index:idx_disk_pool_status_type,priority:3"`    // 磁盘角色
-	Status  DiskPoolStatus `gorm:"index:idx_disk_pool_status_type,priority:2"`    // 运行状态
+	Id      int64          `gorm:"primaryKey"`
+	Path    string         `gorm:"uniqueIndex"`                                // 盘路径（本地目录 / S3 bucket）
+	PoolId  int64          `gorm:"index:idx_disk_pool_status_type,priority:1"` // 所属存储池
+	Backend DiskBackend    // 后端类型
+	Type    DiskType       `gorm:"index:idx_disk_pool_status_type,priority:3"` // 磁盘角色
+	Status  DiskPoolStatus `gorm:"index:idx_disk_pool_status_type,priority:2"` // 运行状态
 }
 
 // Pool 是一个 Reed-Solomon 纠删码存储池。
@@ -67,19 +67,16 @@ type Stripe struct {
 type ChunkStatus int8
 
 const (
-	ChunkReserved ChunkStatus = iota // 0 — 预分配槽位，尚未写入
-	ChunkPending                     // 1 — 数据已写入磁盘，待计算 parity
-	ChunkDirty                       // 2 — 数据已更新，parity 需重新计算
-	ChunkActive                      // 3 — 数据与 parity 均已就绪
-	ChunkError                       // 4 — 数据损坏或磁盘故障
+	ChunkReserved  ChunkStatus = iota // 0 — 预分配槽位，尚未写入
+	ChunkAllocated                    // 1 — 数据块已分配
 )
 
 // ChunkType chunk 在条带中的角色。
 type ChunkType int8
 
 const (
-	DataChunk  ChunkType = iota // 0 — 数据分片
-	ParityChunk                 // 1 — RS 校验分片
+	DataChunk   ChunkType = iota // 0 — 数据分片
+	ParityChunk                  // 1 — RS 校验分片
 )
 
 // Chunk 是条带中的一个分片，存储在 Disk 上。
@@ -89,50 +86,50 @@ type Chunk struct {
 	Path      string      // 相对路径（在 Disk.Path 下的位置）
 	Size      int64       // 数据实际大小（字节）
 	Checksum  []byte      // BLAKE3 哈希，用于数据完整性校验
-	DiskId    int64       `gorm:"index"`  // 所在磁盘
-	StripeId  int64       `gorm:"index"`  // 所属条带
+	DiskId    int64       `gorm:"index"` // 所在磁盘
+	StripeId  int64       `gorm:"index"` // 所属条带
+	PoolId    int64       `gorm:"index"` // 所属存储池
 	Type      ChunkType
-	Index     int64       // 在条带中的序号（data=0..D-1, parity=0..P-1）
-	CreatedAt int64       `gorm:"autoCreateTime"`
+	Index     int64 // 在条带中的序号（data=0..D-1, parity=0..P-1）
+	CreatedAt int64 `gorm:"autoCreateTime"`
 }
 
-// ChunkOp WriteQueue 中记录的操作类型。
-type ChunkOp int8
+// WriteQueue 是 write 计算的任务队列。
+// 当 data chunk 写入或更新时入队，parity worker 出队后计算 RS parity。
+type WriteQueue struct {
+	Id        int64 `gorm:"primaryKey"`
+	ChunkId   int64 `gorm:"index"`
+	StripeId  int64 `gorm:"index"`
+	CreatedAt int64 `gorm:"autoCreateTime;index"`
+}
+
+type StripeQueueType int8
 
 const (
-	ChunkWrite ChunkOp = iota // 0 — 写入（新建或更新）
-	ChunkDelete               // 1 — 删除（预留）
-)
-
-// WriteQueueStatus WriteQueue 条目的处理状态。
-type WriteQueueStatus int8
-
-const (
-	QueuePending    WriteQueueStatus = iota // 0 — 等待处理
-	QueueProcessing                        // 1 — 正在处理
+	StripeQueueParity = iota
+	StripeQueueRebuild
 )
 
 // WriteQueue 是 parity 计算的任务队列。
 // 当 data chunk 写入或更新时入队，parity worker 出队后计算 RS parity。
-type WriteQueue struct {
-	Id        int64            `gorm:"primaryKey"`
-	ChunkId   int64            `gorm:"index"`
-	StripeId  int64            `gorm:"index"`
-	Op        ChunkOp          `gorm:"index"`
-	Status    WriteQueueStatus `gorm:"index;default:0"`
-	CreatedAt int64            `gorm:"autoCreateTime;index"`
+type StripeQueue struct {
+	Id        int64           `gorm:"primaryKey"`
+	StripeId  int64           `gorm:"index"`
+	Type      StripeQueueType `gorm:"index"`
+	Status    TaskStatus      `gorm:"index;default:0"`
+	CreatedAt int64           `gorm:"autoCreateTime;index"`
 }
 
 // ReadCache 记录 chunk 在缓存盘上的副本。
 // 同一 chunk 最多有一条未过期的缓存记录。
 type ReadCache struct {
-	Id        int64 `gorm:"primaryKey"`
-	ChunkId   int64 `gorm:"uniqueIndex"`               // 缓存哪个 chunk
-	Path      string                                    // 缓存文件相对路径
-	DiskId    int64 `gorm:"index"`                      // 缓存所在磁盘
-	CreatedAt int64 `gorm:"autoCreateTime;index"`
-	UpdatedAt int64 `gorm:"autoUpdateTime;index"`
-	ExpiredAt int64 `gorm:"index"`                      // 过期时间戳，超时后清理
+	Id          int64  `gorm:"primaryKey"`
+	ChunkId     int64  `gorm:"uniqueIndex"` // 缓存哪个 chunk
+	Path        string // 缓存文件相对路径
+	DiskId      int64  `gorm:"index"` // 缓存所在磁盘
+	AccessCount int64  `gorm:"index"`
+	CreatedAt   int64  `gorm:"autoCreateTime;index"`
+	UpdatedAt   int64  `gorm:"autoUpdateTime;index"`
 }
 
 // Setting 存储全局 KV 配置（如 HTTP_PORT）。
@@ -156,13 +153,13 @@ const (
 // Task 记录后台任务的执行历史。
 // 通过 acquireLock/releaseLock 机制保证同一时间只有一个 Running 任务。
 type Task struct {
-	Id        int64           `gorm:"primaryKey"`
-	Name      string          `gorm:"index"`
-	Status    TaskStatus      `gorm:"index"`
-	Message   string          // 任务描述
+	Id        int64          `gorm:"primaryKey"`
+	Name      string         `gorm:"index"`
+	Status    TaskStatus     `gorm:"index"`
+	Message   string         // 任务描述
 	Metadata  datatypes.JSON `gorm:"type:json"` // 上下文元数据（JSON）
-	CreatedAt int64           `gorm:"autoCreateTime;index"`
-	UpdatedAt int64           `gorm:"autoUpdateTime"`
+	CreatedAt int64          `gorm:"autoCreateTime;index"`
+	UpdatedAt int64          `gorm:"autoUpdateTime"`
 }
 
 // ── Share Layer (User/Share/Inode/Version) ──
@@ -217,11 +214,11 @@ type User struct {
 type Share struct {
 	Id                int64  `gorm:"primaryKey"`
 	Name              string `gorm:"uniqueIndex;not null"`
-	PoolId            int64  `gorm:"index;not null"`       // 绑定到哪个存储池
-	Compression       int8   `gorm:"default:0"`            // 压缩算法（0=无）
-	Encryption        int8   `gorm:"default:0"`            // 加密算法（0=无）
-	EncryptionKeyHash []byte `gorm:"default:null"`         // 加密密钥哈希（启用加密时非空）
-	CreatedBy         int64  `gorm:"index"`                // 创建者用户 ID
+	PoolId            int64  `gorm:"index;not null"` // 绑定到哪个存储池
+	Compression       int8   `gorm:"default:0"`      // 压缩算法（0=无）
+	Encryption        int8   `gorm:"default:0"`      // 加密算法（0=无）
+	EncryptionKeyHash []byte `gorm:"default:null"`   // 加密密钥哈希（启用加密时非空）
+	CreatedBy         int64  `gorm:"index"`          // 创建者用户 ID
 	CreatedAt         int64  `gorm:"autoCreateTime"`
 }
 
@@ -244,7 +241,9 @@ type Inode struct {
 	ShareId   int64         `gorm:"index"`
 	VersionId sql.NullInt64 `gorm:"index"` // 当前文件版本（目录/链接为 NULL）
 	LinkId    sql.NullInt64 `gorm:"index"` // 链接目标 inode（仅 kind=link）
+	CreatedBy int64         `gorm:"index"` // 创建用户ID
 	CreatedAt int64         `gorm:"autoCreateTime"`
+	UpdatedBy int64         `gorm:"index"`
 	UpdatedAt int64         `gorm:"autoUpdateTime"`
 	Deleted   int8          `gorm:"default:0;index"` // 软删除标记
 }
@@ -252,24 +251,24 @@ type Inode struct {
 // Version 是文件的一个快照版本。
 // 同一文件的版本号递增，支持回滚和版本管理。
 type Version struct {
-	Id         int64 `gorm:"primaryKey;autoIncrement"`
-	InodeId    int64 `gorm:"uniqueIndex:idx_ver_inode_num,priority:1;not null"`
-	VersionNum int64 `gorm:"uniqueIndex:idx_ver_inode_num,priority:2;not null"` // 版本号（从 1 递增）
-	Size       int64 `gorm:"default:0"`                                          // 文件总大小
-	Checksum   string                                                            // 文件级哈希（所有 chunk 拼接后）
-	CreatedAt  int64 `gorm:"autoCreateTime"`
+	Id        int64  `gorm:"primaryKey;autoIncrement"`
+	InodeId   int64  `gorm:"uniqueIndex:idx_ver_inode_num,priority:1;not null"`
+	Size      int64  `gorm:"default:0"` // 文件总大小
+	Checksum  string // 文件级哈希（所有 chunk 拼接后）
+	CreatedBy int64  `gorm:"index"` // 创建用户ID
+	CreatedAt int64  `gorm:"autoCreateTime"`
 }
 
 // VersionChunk 将文件版本的逻辑切片映射到存储层的 chunk。
 // idx 表示切片在文件中的顺序，读取时按 idx 排序拼接。
 type VersionChunk struct {
 	VersionId   int64  `gorm:"primaryKey"`
-	Idx         int64  `gorm:"primaryKey"`    // 切片序号
+	Idx         int64  `gorm:"primaryKey"`     // 切片序号
 	ChunkId     int64  `gorm:"index;not null"` // 对应的存储层 chunk
 	Size        int64  `gorm:"not null"`       // 切片大小
 	Checksum    []byte `gorm:"not null"`       // 切片级哈希
-	IsEncrypted int8   `gorm:"default:0"`
-	Compressed  int8   `gorm:"default:0"`
+	Encryption  int8   `gorm:"default:0"`
+	Compression int8   `gorm:"default:0"`
 }
 
 // InodeHistory 记录 inode 的元数据变更事件（创建/改名/移动/删除）。

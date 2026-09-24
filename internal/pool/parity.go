@@ -198,7 +198,7 @@ func (p *PoolManager) computeStripe(stripeId int64, dataShards, parityShards int
 	return results, true
 }
 
-// processWriteQueue 是 parity worker 的核心调度函数。
+// processStripeQueue 是 parity worker 的核心调度函数。
 //
 // 整体流程：
 //  1. 清理上次意外残留的 QueueProcessing 条目
@@ -209,24 +209,24 @@ func (p *PoolManager) computeStripe(stripeId int64, dataShards, parityShards int
 //  6. Phase 2: 在一个事务中批量更新 data chunk→Active、parity chunk→Active、删除已处理的 WriteQueue
 //
 // 返回 true 表示处理了至少一个条目，false 表示空闲。
-func (p *PoolManager) processWriteQueue() bool {
+func (p *PoolManager) processStripeQueue() bool {
 	// ---------------------------------------------------------------
 	// Step 1: 清理上次异常中断残留的 QueueProcessing 条目。
 	// 如果进程在上次批次中间崩溃，这些条目会永远卡在 Processing 状态。
 	// 将它们重置为 Pending，让本次重新处理。
 	// ---------------------------------------------------------------
 	p.DbManager.DB.Model(&db.WriteQueue{}).
-		Where("status = ?", db.QueueProcessing).Update("status", db.QueuePending)
+		Where("status = ?", db.TaskRunning).Update("status", db.TaskPending)
 
 	// ---------------------------------------------------------------
 	// Step 2: 在一个事务中原子地领走一批 QueuePending 条目。
 	// 使用 SKIP LOCKED 避免多个 parity worker（如果有）之间的锁竞争。
-	// 领走后将状态改为 QueueProcessing，防止被其他 worker 重复领取。
+	// 领走后将状态改为 TaskRunning，防止被其他 worker 重复领取。
 	// ---------------------------------------------------------------
 	var entries []db.WriteQueue
 	err := p.DbManager.DB.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
-			Where("status = ?", db.QueuePending).
+			Where("status = ?", db.TaskPending).
 			Find(&entries).Error; err != nil {
 			return err
 		}
@@ -238,7 +238,7 @@ func (p *PoolManager) processWriteQueue() bool {
 			ids[i] = e.Id
 		}
 		return tx.Model(&db.WriteQueue{}).
-			Where("id IN ?", ids).Update("status", db.QueueProcessing).Error
+			Where("id IN ?", ids).Update("status", db.TaskRunning).Error
 	})
 	if err != nil {
 		log.Printf("parity: claim pending entries failed: %v", err)
@@ -318,8 +318,8 @@ func (p *PoolManager) processWriteQueue() bool {
 	type stripeJob struct {
 		dataChunks    []db.Chunk
 		parityByIndex map[int64]db.Chunk
-		skip          bool            // 标记该 stripe 是否应跳过
-		ds, ps        int             // data shards / parity shards 数量
+		skip          bool // 标记该 stripe 是否应跳过
+		ds, ps        int  // data shards / parity shards 数量
 	}
 	jobs := make(map[int64]*stripeJob, len(stripeIds))
 
@@ -335,8 +335,7 @@ func (p *PoolManager) processWriteQueue() bool {
 		// 按 chunk 类型分别收集
 		if c.Type == db.DataChunk {
 			// data chunk 处于 Pending 或 Error 状态时，跳过整个 stripe
-			if c.Status == db.ChunkPending || c.Status == db.ChunkError {
-				log.Printf("parity: stripe %d data index %d status=%d, skip", c.StripeId, c.Index, c.Status)
+			if c.Status == db.ChunkAllocated {
 				j.skip = true
 				continue
 			}
@@ -371,51 +370,6 @@ func (p *PoolManager) processWriteQueue() bool {
 	}
 
 	// ---------------------------------------------------------------
-	// Phase 1: 统一锁住所有待处理 stripe 的 parity chunk，标记为 Pending。
-	//
-	// 为什么锁全部而非逐条：
-	//   - 防止两个批次同时处理同一个 stripe 的 parity
-	//   - 如果某个 stripe 的 parity 已经是 Pending（来自上一批），跳过整个 stripe
-	// ---------------------------------------------------------------
-	err = p.DbManager.DB.Transaction(func(tx *gorm.DB) error {
-		var allParity []db.Chunk
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("stripe_id IN ? AND type = ?", stripeIds, db.ParityChunk).
-			Find(&allParity).Error; err != nil {
-			return fmt.Errorf("lock parity: %w", err)
-		}
-		// 检查哪些 stripe 的 parity 已经是 Pending 状态
-		pendingStripes := make(map[int64]bool)
-		for _, c := range allParity {
-			if c.Status == db.ChunkPending {
-				pendingStripes[c.StripeId] = true
-			}
-		}
-		// 标记这些 stripe 为跳过
-		for sid := range pendingStripes {
-			if j, ok := jobs[sid]; ok {
-				j.skip = true
-				log.Printf("parity: stripe %d parity pending, skip", sid)
-			}
-		}
-		// 收集非跳过 stripe 的 parity id，统一更新为 Pending
-		var toUpdate []int64
-		for _, c := range allParity {
-			if j, ok := jobs[c.StripeId]; ok && !j.skip {
-				toUpdate = append(toUpdate, c.Id)
-			}
-		}
-		if len(toUpdate) == 0 {
-			return nil
-		}
-		return tx.Model(&db.Chunk{}).Where("id IN ?", toUpdate).Update("status", db.ChunkPending).Error
-	})
-	if err != nil {
-		log.Printf("parity: phase1 failed: %v", err)
-		return false
-	}
-
-	// ---------------------------------------------------------------
 	// 并发计算 RS parity：对每个待处理的 stripe 启动一个 goroutine，
 	// 最多同时运行 4 个（信号量控制），防止内存被大量 stripe 撑爆。
 	// ---------------------------------------------------------------
@@ -436,7 +390,7 @@ func (p *PoolManager) processWriteQueue() bool {
 		computeWg.Add(1)
 		go func(sid int64, j *stripeJob) {
 			defer computeWg.Done()
-			sem <- struct{}{}       // 获取信号量
+			sem <- struct{}{}        // 获取信号量
 			defer func() { <-sem }() // 释放信号量
 			res, ok := p.computeStripe(sid, j.ds, j.ps, j.dataChunks, j.parityByIndex, diskById)
 			resultCh <- jobResult{stripeId: sid, ok: ok, results: res}
@@ -494,10 +448,7 @@ func (p *PoolManager) processWriteQueue() bool {
 	err = p.DbManager.DB.Transaction(func(tx *gorm.DB) error {
 		// 将所有成功计算的 data chunk 标记为 Active
 		if len(allDataIds) > 0 {
-			if err := tx.Model(&db.Chunk{}).Where("id IN ?", allDataIds).
-				Update("status", db.ChunkActive).Error; err != nil {
-				return fmt.Errorf("update data: %w", err)
-			}
+
 		}
 		// 加载 parity chunk 并更新大小和校验和
 		if len(allParityIds) > 0 {
@@ -511,7 +462,7 @@ func (p *PoolManager) processWriteQueue() bool {
 			}
 			for i := range parity {
 				pu := puMap[parity[i].Id]
-				parity[i].Status = db.ChunkActive
+				parity[i].Status = db.ChunkAllocated
 				parity[i].Size = pu.size
 				parity[i].Checksum = pu.hash
 			}
@@ -520,7 +471,7 @@ func (p *PoolManager) processWriteQueue() bool {
 			}
 		}
 		// 删除已处理完毕的 WriteQueue 条目
-		return tx.Where("status = ?", db.QueueProcessing).Delete(&db.WriteQueue{}).Error
+		return tx.Where("status = ?", db.TaskRunning).Delete(&db.WriteQueue{}).Error
 	})
 	if err != nil {
 		log.Printf("parity: phase2 failed: %v", err)
@@ -552,7 +503,7 @@ func (p *PoolManager) StartParityWorker(ctx context.Context) {
 				return
 			case <-ticker.C:
 				// 执行一次 parity 处理
-				hadWork := p.processWriteQueue()
+				hadWork := p.processStripeQueue()
 				if hadWork {
 					// 有任务处理，恢复为 1 秒间隔
 					interval = 1 * time.Second
