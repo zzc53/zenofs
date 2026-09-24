@@ -1,0 +1,25 @@
+{
+  "name": "zenofs-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "check": "tsc --noEmit",
+    "preview": "vite preview",
+    "test": "node --test src/*.test.ts"
+  },
+  "dependencies": {
+    "@preact/signals": "^2.11.2",
+    "preact": "^10.29.8",
+    "qrcode-generator": "^2.0.4"
+  },
+  "devDependencies": {
+    "@preact/preset-vite": "^2.10.6",
+    "@types/node": "^26.6.2",
+    "@types/qrcode-generator": "^0.0.16",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.0"
+  }
+}

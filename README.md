@@ -40,6 +40,8 @@ go test ./...                         # 单元测试（见"测试"一节）
 
 go run ./cmd/zenofs                   # 默认 sqlite://zenofs.db
 go run ./cmd/zenofs "postgres://..."  # 也可用 ZENOFS_DSN 环境变量
+
+cd web && npm ci && npm run build     # 构建前端（产物 embed 进二进制，见"Web 前端"一节）
 ```
 
 DSN 前缀决定驱动（`sqlite://` / `mysql://` / `postgres://`）。HTTP 端口取自 `settings` 表的
@@ -66,10 +68,17 @@ SQLite 库通过 `internal/testutil` 建好并 `AutoMigrate`，不起任何 mock
 | `internal/config` | 配置优先级 argv > `ZENOFS_DSN` > 默认值 | 100% |
 | `internal/db` | DSN 分支、`AutoMigrate` 建表/幂等/默认配置、`GetSetting` | 93% |
 | `internal/pool` | 池/盘参数校验、chunk 写入-读取-覆写、预留槽位复用、write queue → stripe queue 搬运、RS parity 编码（与 `reedsolomon` 独立复算比对）、坏块重建与换盘恢复、读缓存落盘与冷却淘汰、`parallelEach` 并发上限 | 77% |
-| `internal/vfs` | 路径规范化与 `checkName`、zstd 往返与压缩效果、AES-GCM 加解密与篡改检测、口令生命周期、ShareFS 命名空间/权限/配额/稀疏/版本提交/快照隔离、切片级写时复制、Truncate 的截断裁剪与对齐边界、`RootFS` 根聚合（可见性、只读视图、跨 Share、密钥保留）、**错误码标准化**（每个哨兵都带 `Code`/`StrCode`，并从真实操作取码校验） | 82% |
-| `internal/api` | 真实 chi 路由 + `httptest`：建池/查池/下线/加盘/换盘/重建/chunk 上传-下载-覆写，以及各类 400 | 80% |
+| `internal/vfs` | 路径规范化与 `checkName`、zstd 往返与压缩效果、AES-GCM 加解密与篡改检测、口令生命周期、**进程级密钥表（解锁后跨实例可读、上锁后读写均失败）**、回收站（列出/恢复/彻底删除/父目录已删时回到根）、ShareFS 命名空间/权限/配额/稀疏/版本提交/快照隔离、切片级写时复制、Truncate 对边界、`RootFS` 根聚合、**错误码标准化** | 81% |
+| `internal/api` | 真实 HTTP 服务 + `httptest`：bootstrap/登录/JWT（含 401/403/404/409/423 映射）、用户与 Share 管理、文件上下传与回收站、加密 Share 的解锁/上锁、`?access_token=` 鉴权与日志脱敏、静态资源挂载与保留路径、建池/加盘/换盘/重建/chunk 读写 | 64% |
+| `internal/auth` | bcrypt 密码、TOTP 二次验证、JWT 签发/过期/篡改/用户被删、用户 CRUD 与连带清理、密钥与 TTL 的配置读取 | 83% |
+| `internal/otp` | RFC 6238 官方测试向量、±1 步长漂移、坏输入、密钥大小写/空格/填充容错、`otpauth://` URI | 94% |
+| `internal/token` | token 生成与唯一性、只落单向摘要（BLAKE3 + NT hash）、过期判定、公钥注册与指纹、跨用户拒绝、SMB 候选摘要 | 87% |
+| `internal/smb` | 端到端（真 SMB 客户端登录 + 读写落盘）、错误 token/过期 token 被拒、未授权 Share 拒绝、路径/错误码映射 | 46% |
+| `internal/sftp` | 端到端（公钥与 token 口令两种登录）、文件往返与目录操作、只读 Share 拒绝、主机密钥持久化与复用 | 67% |
+| `internal/webdav` | 认证（401/凭证无效）、GET/PUT/PROPFIND/MKCOL/MOVE/COPY/DELETE、LOCK/UNLOCK 恒成功、未授权 Share 404、路径穿越、只读 Share 写 403 | 77% |
+| `internal/webui` | 静态资源与 SPA 回退、`index.html` 禁缓存、产物文件长缓存、路径穿越回退 | 73% |
 
-**不测**：`cmd/zenofs`（进程装配）与后台 worker 的定时/异步时序
+**不测**：后台 worker 的定时/异步时序
 （`StartParityWorker`、`StartCacheCleaner` 的 ticker 循环、并行调度的等待逻辑）——这类用例要等时钟、
 容易 flaky。它们背后的同步内核（`calculateStripeParity`、`rebuildStripe`、`cleanupColdCache`、
 `Flush`）都由上面的用例直接驱动，逻辑本身是覆盖到的。
@@ -78,17 +87,21 @@ SQLite 库通过 `internal/testutil` 建好并 `AutoMigrate`，不起任何 mock
 
 ```
 cmd/zenofs/        入口：配置 → DB/AutoMigrate → PoolManager → 后台 worker → HTTP
+web/               前端源码（Vite + Preact + TypeScript）；构建产物输出到 internal/webui/dist
 internal/api/      chi 路由与 JSON 响应
+internal/auth/     用户与登录态：bcrypt 密码 + TOTP 二次验证 + JWT 签发与校验
 internal/config/   配置加载（argv > ZENOFS_DSN > 默认值）
 internal/db/       GORM 连接与全部数据模型
 internal/errs/     统一错误码与 ZenoError
 internal/hash/     摘要算法收口（BLAKE3-256；分片/校验分片/口令校验值都用它）
-internal/pool/     核心：存储池 / 磁盘 / chunk / parity / 读缓存
+internal/otp/      TOTP 实现（RFC 6238：SHA-1 / 30 秒 / 6 位）与密钥生成
+internal/pool/     核心：存储池 / 磁盘 / chunk / parity / 读缓存；Keyring = 加密 Share 的内存密钥表
 internal/testutil/ 测试脚手架：临时 SQLite 库 + 本地盘存储池 + Share 行（只被 _test.go 引用）
 internal/token/    访问凭证（access token）：生成 / 单向摘要 / 过期校验，SMB / SFTP / WebDAV 共用
 internal/smb/      SMB2/3 服务端（jfjallid/go-smb）：共享注册 + NTLMv2 认证 + vfs 适配
 internal/sftp/     SFTP 服务端（x/crypto/ssh + pkg/sftp）：公钥 / token 口令认证 + vfs 适配
 internal/webdav/   WebDAV 服务端（x/net/webdav）：挂在 HTTP API 服务上（同一端口，默认 /dav）
+internal/webui/    把前端产物 embed 进二进制并提供静态资源 / SPA 回退
 internal/vfs/      文件系统层（SMB / WebDAV / SFTP 共用）：接口定义 + 基于 Share/Inode/Version 的实现
                    （ShareFS = 单 Share，RootFS = 把用户可见的多个 Share 挂在同一个根下）
 ```
@@ -105,7 +118,7 @@ internal/vfs/      文件系统层（SMB / WebDAV / SFTP 共用）：接口定�
 
 | 表 | 用途 | 关键字段 |
 |---|---|---|
-| `pools` | RS 存储池 | `name`(唯一) `data_shards` `parity_shards` `chunk_size`(KB) `status` |
+| `pools` | RS 存储池 | `name`(唯一) `data_shards` `parity_shards` `chunk_size`(KB，同时是池内所有 Share 的文件切片大小) `status` |
 | `disks` | 池内磁盘 | `path`(唯一) `pool_id` `backend` `type` `status`；索引 `(pool_id, status, type)` |
 | `stripes` | RS 条带 | `pool_id` |
 | `chunks` | 分片（data / parity 同表） | `status` `path` `size` `hash`(BLAKE3) `disk_id` `stripe_id` `pool_id` `type` `index` |
@@ -118,6 +131,10 @@ internal/vfs/      文件系统层（SMB / WebDAV / SFTP 共用）：接口定�
 ### Share Layer
 
 `users` `shares` `share_users` `inodes` `versions` `version_chunks` `inode_histories`
+
+`users` 里除了用户名与 bcrypt 密码哈希，还存 TOTP 密钥（`otp_secret`，base32）：登录必须
+**同时**通过密码与六位验证码。软删除的 `inodes`（`deleted = 1`）就是回收站的来源，
+`inode_histories` 记录创建/改名/移动/删除/恢复事件。
 
 `internal/vfs` 定义了 SMB / WebDAV / SFTP 共用的 `FileSystem` / `File` 接口，并给出两个实现：
 `ShareFS`（一个实例挂一个 Share）与 `RootFS`（把用户可见的多个 Share 挂在同一个根下，
@@ -171,17 +188,38 @@ internal/vfs/      文件系统层（SMB / WebDAV / SFTP 共用）：接口定�
 | `StripeQueueType` | `StripeQueueParity`(0) `StripeQueueRebuild`(1) |
 | `CacheStatus` | `NotCached`(0) `Cached`(1) |
 | `AccessTokenKind` | `TokenSecret`(0，通用 token) `TokenPublicKey`(1，仅 SFTP 公钥) |
+| `UserRole` | `UserNormal`(0) `UserAdmin`(1) |
+| `SharePermission` | `ShareRead`(0) `ShareWrite`(1) `ShareAdmin`(2) |
+| `InodeEventType` | `InodeCreated`(0) `InodeRenamed`(1) `InodeMoved`(2) `InodeDeleted`(3) `InodeRestored`(4) |
 
 ## 核心流程
 
 ### 存储池与磁盘
 
-- `AddPool(name, chunkSizeKb)`：`chunk_size` 限 1~65536 KB，名称唯一。
+- `AddPool(name, chunkSizeKb)`：`chunk_size` 限 1~65536 KB，名称唯一。它同时决定
+  池内所有 Share 的文件切片大小（写入时一个切片就是一个 chunk，所以切片必须 ≤ chunk 上限）。
+- 加盘的 API 交互：先选 `type`（`"data"` = 参与条带化 / `"cache"` = 仅读缓存），只有 `data` 盘
+  才谈得上 `add_parity`。三条服务端校验：**池里还没有数据分片时不许加 parity**（没有数据分片就
+  没有东西可保护，报 `POOL_BAD`）、**池里还没有数据盘时不许加缓存盘**（缓存存的只是读副本，
+  没有数据盘就没有东西可缓存，同样报 `POOL_BAD`）、**缓存盘带 `add_parity` 直接 400**
+  （而不是悄悄忽略）。Web UI 也按这个来：选了缓存盘就不显示 parity 选项；池里还没有数据盘时
+  缓存盘选项直接禁用。
+- `DeleteCacheDisk(diskId)` / `DELETE /api/disks/{diskId}`：**删除缓存盘**（仅管理员），
+  连同盘上的缓存文件与 `read_caches` 记录一起清掉，返回 `{"status":"deleted","removed_caches":N}`。
+  只允许删缓存盘——数据盘（含 parity 位）是唯一数据副本，删掉会丢数据，那种情况走
+  "下线 / 换盘 + 重建"。删除是安全的：读路径在缓存文件读不到时会回退到源盘，
+  所以即使此刻正好有请求命中这块盘，也只是多一次回退。
 - `AddDisk(poolId, path, backend, diskType, addParity)`：
   - `DataDisk`：事务内建盘并调整池配置——`addParity=false` 使 `DataShards++`，`true` 使 `ParityShards++`；
     随后为该池**已有**的每个 stripe 补一个 `ChunkReserved` 的 slot（新盘补齐条带位置）。
   - `CacheDisk`：只建记录，不参与条带化。
-- 注意：parity 盘在表里 `type` 仍是 `DataDisk`，靠 `addParity` 决定它在条带中占 data 位还是 parity 位。
+- 注意 `disks.type` **只区分"是否参与条带化"**（`DataDisk` / `CacheDisk`），它**不是**
+  "数据盘 vs 校验盘"的角色：parity 盘在表里同样是 `DataDisk`。真正决定冗余度的是池的
+  `data_shards` / `parity_shards`，而 `addParity=true` 的效果就是 `ParityShards+1`
+  （为新盘在**已有**条带里补一个 parity 槽位）。
+- 条带里的 data / parity 槽位在建**每个**条带时按打乱后的盘序分配（`getNewChunks`），
+  所以同一块盘在不同条带里可能承担不同角色。也正因如此，Web UI 只在池级别展示
+  Data / Parity 分片数，不给每块盘标"角色"。
 - 关键约束：建新条带时要求**在线 DataDisk 数 == DataShards + ParityShards**，否则报 `DISK_OFFLINE`
   （见 `getNewChunks`）——即池内数据盘数量必须与 RS 参数严格一致。
 - `OfflinePool` 改池状态；`SwapDisk` 把盘标记为 `Repair` 并换路径。
@@ -296,7 +334,12 @@ SMB / WebDAV / SFTP 这类协议有统一的根目录：客户端连上来要先
 - **读**：以"句柄打开时的那个版本"为准（**快照语义**）。按 `VersionChunk.Idx` 懒加载切片，
   缺少某个 Idx 就是稀疏空洞，读作零。读失败或校验不过会顺手为该条带投递重建任务
   （`PoolManager.RebuildByChunks`）。
-- **写**：**切片级写时复制**。`idx = offset / Share.SliceSize`，只重建被写到的切片；
+- **写**：**切片级写时复制**。`idx = offset / <切片大小>`，只重建被写到的切片；
+  切片大小**取自所属池的 `chunk_size`**（Share 上不再单独配置——见 `vfs.sliceSize`），
+  并从中扣掉编码余量（压缩膨胀 + 加密的 nonce/tag，见 `sliceOverheadFor`）。原因：写进池的
+  是编码**之后**的字节，而池会拒绝超过 chunk 上限的块——不留这点余量，"文件大小正好是切片
+  整数倍"时的满切片会被 `CHUNK_SIZE_EXCEED` 拒收。未压缩未加密时开销为 0，切片精确等于
+  池的 `chunk_size`。
   新版本会先继承旧版本的全部切片映射，未触及的 Idx 直接沿用旧 chunk（chunk 不可变且不回收，
   多版本共享是安全的）。新切片实时写入存储池并 upsert `VersionChunk`；
   同一 Idx 反复写时只在内存里改一份明文缓冲，切到别的 Idx 或 Close/Sync 时才落盘。
@@ -344,24 +387,184 @@ func firstErr(errs []error) error
 它**保证所有任务执行完**（不像 errgroup 那样 fail-fast），因为调用方常需要知道每个下标的成败。
 返回值与 `n` 等长，第 `i` 项即 `fn(i)` 的错误；`fn` 只应写自己下标的槽位。
 
+## Web 前端
+
+轻量 Web UI：**英语为默认语言，可切中文**；首次运行自动进入引导流程
+（创建管理员 → 建存储池 → 加磁盘 → 建共享），之后是文件管理与管理界面。
+
+- **技术栈**：Vite + Preact + TypeScript + signals，手写 CSS，无第三方 UI 库。
+  构建产物（约 70 KB JS / 5 KB CSS，gzip 后约 22 KB）用 `//go:embed` 打进二进制，
+  部署仍然只有一个文件。
+- **挂载位置**：与 REST API、WebDAV **共用同一个 HTTP 服务**（同一个端口）。分发规则：
+  `/api/*` → REST API，`/dav/*`（或配置的 WebDAV 前缀）→ WebDAV，其余 → 前端静态资源
+  （未知路径回 `index.html`，前端自己用 hash 路由）。关掉 WebDAV 后 `/dav/` 会明确回 404，
+  而不是让浏览器拿到一张 HTML。
+- **开关**：`settings.WEBUI_ENABLED=0` 关掉前端（接口-only 部署）。
+
+| 页面 | 内容 |
+|---|---|
+| 引导向导 | 四步：首个管理员 → 存储池 → 磁盘 → 共享。OTP 密钥**进页面就在浏览器里生成好**（带二维码、可点“换一个密钥”重新生成，密钥不经过任何 URL），第 1 步建完管理员会自动用它算码登录 |
+| 登录 | 用户名 + 密码 + 六位验证码（TOTP） |
+| 文件 | 共享切换、面包屑、目录列表、拖拽或选择上传、下载、新建文件夹、改名、删除（进回收站）、配额用量条、加密共享的解锁/取消解密 |
+| 回收站 | 列出、恢复、彻底删除、清空 |
+| 管理 · 共享 | 新建（可选口令启用加密）、改配额/压缩、授权（read/write/admin）、解锁/取消解密、强制删除 |
+| 管理 · 用户 | 新建（角色 + OTP）、改密码/角色、重置 OTP（新密钥只显示一次）、删除 |
+| 管理 · 存储池 | 建池、加盘（先选用途：数据盘 / 缓存盘；数据盘且池里已有盘时才出现“计入校验分片”，池里没有数据盘时缓存盘不可选）、下线、换盘、重建（reconstruct）、删除缓存盘、后台任务列表 |
+| 管理 · 凭证 | 生成访问 token（明文只显示一次）、注册 SFTP 公钥、吊销 |
+
+```bash
+cd web
+npm ci            # 安装依赖（node_modules 不进仓库）
+npm run dev       # 开发模式：vite 起 5173，/api 代理到 127.0.0.1:8080
+npm run build     # 类型检查 + 构建，产物写到 internal/webui/dist（跟着仓库提交）
+npm test          # 纯函数测试（前端算的 TOTP 必须与服务端一致，用 RFC 6238 向量校验）
+```
+
+**下载与 token**：浏览器用 `<a href>` 下载时发不出 `Authorization` 头，所以前端的下载直链把 JWT
+放在 `?access_token=` 里；后端最外层会先把 token 从 URL 摘出来放进 context、再记访问日志
+（`internal/api` 的 `stripAccessToken`），**日志里不会留下 token**。
+
+## HTTP API
+
+所有端点都在 `/api` 下（WebDAV 挂在 `/dav`，见下一节）。**除 bootstrap 与登录之外，
+每个请求都要带 `Authorization: Bearer <JWT>`**；缺 token 或 token 失效回 401。
+
+**关于超时**：HTTP 服务**不设** `ReadTimeout` / `WriteTimeout`——上传下载（包括 WebDAV）可能
+持续几分钟到几十分钟，按固定时间掐断会把传输弄坏（典型表现是"上传到第 10 秒整失败、回 400"）。
+抗慢速连接靠 `ReadHeaderTimeout`（10 秒，只管请求头）与 `IdleTimeout`（120 秒，回收闲置连接）；
+要限制单次传输的时长或带宽，请在反向代理层做。上传中途断开（客户端掉线、连接被中断）时，
+服务端会把**已写入的半成品删掉**，不会在目录里留下一个看着正常、其实不完整的文件。
+
+### 认证与用户
+
+- **首个用户**：`users` 表为空时 `POST /api/auth/bootstrap` 免认证创建，并且固定是管理员。
+- **二次验证**：TOTP（RFC 6238，SHA-1 / 30 秒 / 6 位），密钥是 base32 文本。创建/重置用户时
+  要么「给密钥 + 给当前六位验证码」（服务端校验码对不对，防止密钥录错），要么两个都不给——
+  服务端生成密钥并在响应里返回一次（`otp_secret` + 可直接扫码的 `otp_uri`）。
+- **登录**：`POST /api/auth/login` 提交用户名 + 密码 + 六位验证码，返回 JWT。
+  有效期默认 24 小时（`settings.JWT_TTL`，单位秒），签名密钥是 `settings.JWT_SECRET`
+  （首次启动自动生成 32 字节随机值；删掉它会让所有已签发的 token 失效）。
+- 密码用 bcrypt 存哈希，JWT 用 HS256；用户名不存在与密码错误返回同一个错误（不泄露用户是否存在）。
+
+| 端点 | 说明 |
+|---|---|
+| `POST /api/auth/bootstrap` | 创建第一个管理员（免认证，仅在还没有用户时可用） |
+| `POST /api/auth/login` | 用户名 + 密码 + 六位验证码 → JWT |
+| `GET /api/auth/me` | 当前登录用户 |
+| `GET /api/users` | 列出用户（管理员） |
+| `POST /api/users` | 创建用户（管理员） |
+| `GET /api/users/{id}` | 查询用户（管理员或本人） |
+| `PUT /api/users/{id}` | 改密码 / 角色 / 重置 OTP |
+| `DELETE /api/users/{id}` | 删除用户（管理员；同时清掉授权与访问凭证） |
+
+### Share、文件与回收站
+
+| 端点 | 说明 |
+|---|---|
+| `GET /api/shares` | 列出可见的 Share（管理员看全部，普通用户只看有授权的） |
+| `POST /api/shares` | 创建 Share（管理员） |
+| `GET`/`PUT`/`DELETE` `/api/shares/{id}` | 查询 / 改配额·压缩 / 删除（非空需要 `?force=1`） |
+| `GET`/`POST` `/api/shares/{id}/users` | 列出 / 设置授权（管理员） |
+| `DELETE /api/shares/{id}/users/{userId}` | 撤销授权（管理员） |
+| `GET /api/shares/{id}/list?path=/dir` | 列目录 |
+| `GET /api/shares/{id}/stat?path=/a.txt` | 元数据 |
+| `GET /api/shares/{id}/files?path=/a.txt` | 下载（支持 Range） |
+| `PUT /api/shares/{id}/files?path=/a.txt` | 上传（body 就是文件内容） |
+| `DELETE /api/shares/{id}/files?path=/a.txt` | 删除（软删除，进回收站） |
+| `POST /api/shares/{id}/folders` | 新建目录 `{"path":"/dir"}` |
+| `POST /api/shares/{id}/rename` | 改名 / 移动 `{"from":"/a","to":"/b"}` |
+| `GET /api/shares/{id}/recycle` | 回收站列表（含删除时间与删除者） |
+| `POST /api/shares/{id}/recycle/{inodeId}/restore` | 恢复（原父目录没了就回到 Share 根；同名冲突回 409） |
+| `DELETE /api/shares/{id}/recycle/{inodeId}` | 彻底删除（清掉元数据；存储层 chunk 留给后续 GC） |
+| `DELETE /api/shares/{id}/recycle` | 清空回收站 |
+
+**权限**：能不能读写 Share 只看 `share_users` 里的授权，管理员也不例外——
+`read` 只能读、`write` 能读写、`admin` 还能改授权；没有授权的 Share 一律按"不存在"处理（404），
+不泄露 Share 名。
+
+### 加密 Share（LUKS 式解锁）
+
+加密 Share 的**密钥只存在进程内存里**（`pool.Keyring`，永不落库）：落库的只有"启用了加密"和
+口令校验值（salt + `BLAKE3(密钥)`）。跟 LUKS 一样，进程重启后必须重新 unlock。
+
+| 操作 | 端点 | 说明 |
+|---|---|---|
+| 初始化 + 解锁 | `POST /api/shares` 带 `password` | 只能在**新建的空 Share** 上做（等价 `luksFormat`），建完即解锁 |
+| 解密（打开） | `POST /api/shares/{id}/unlock` `{"password":"..."}` | 校验口令后把密钥放进内存；此后**所有协议**（HTTP / WebDAV / SMB / SFTP）都能访问它 |
+| 取消解密 | `POST /api/shares/{id}/lock` | 丢弃内存里的密钥（字节清零），所有读写立刻失败 |
+| 查看状态 | `GET /api/shares/{id}` 的 `encrypted` / `unlocked` | `unlocked` 就是"密钥此刻在不在内存里" |
+
+- 未解锁（或已上锁）时访问加密 Share，API 返回 **423 Locked**，客户端据此提示先解锁。
+- 判断"能不能写"请用 `encrypted && !unlocked`：**未加密的 Share 同样返回 `unlocked: false`**
+  （它没有密钥），只看 `unlocked` 会把普通 Share 误判成锁住。
+- 只能给**新建的空 Share** 加密：对已有数据的 Share 事后加密会毁数据（老 chunk 是明文，
+  读的时候却按密文解），所以除了 `POST /api/shares` 没有别的"启用加密"入口。
+- unlock / lock 仅管理员可用（普通用户即使拿到该 Share 的 admin 授权也不行）；
+  口令错返回 403，对未加密的 Share 调 unlock 返回 400。
+
+### 存储池与磁盘
+
+| 端点 | 说明 |
+|---|---|
+| `GET`/`POST` `/api/pools` | 列出 / 创建存储池 |
+| `GET /api/pools/{id}` | 查询存储池 |
+| `PUT /api/pools/{id}/offline` | 下线（暂停所有操作） |
+| `GET /api/pools/{id}/disks` | 列出池里的磁盘 |
+| `POST /api/pools/{poolId}/disks` | 加盘：`type` 选 `data` / `cache`，`data` 盘可带 `add_parity` |
+| `PUT /api/disks/{diskId}/swap` | 换盘（转 Repair 并投递重建） |
+| `DELETE /api/disks/{diskId}` | 删除缓存盘（连同缓存文件与记录；管理员） |
+| `POST /api/pools/{id}/rebuild` | 投递条带重建（reconstruct；`/reconstruct` 是同义别名） |
+| `POST /api/pools/{poolId}/chunks`、`GET`/`PUT` `/api/chunks/{id}` | 分片级读写（存储层内部用） |
+
+### 访问凭证（SMB / SFTP / WebDAV 用）
+
+| 端点 | 说明 |
+|---|---|
+| `POST /api/users/{id}/tokens` | 生成访问 token（明文只返回一次） |
+| `GET /api/users/{id}/tokens?kind=` | 列出凭证 |
+| `POST /api/users/{id}/pubkeys` | 注册 SFTP 公钥 |
+| `DELETE /api/tokens/{id}` | 吊销凭证 |
+
+```bash
+# 1) 首次启动后创建管理员：连 otp_secret 都不给，服务端生成并返回一次
+curl -X POST localhost:8080/api/auth/bootstrap \
+  -d '{"username":"root","password":"root-pw-123"}'
+# => {"id":1,"username":"root","role":"admin","otp_secret":"GEZD...","otp_uri":"otpauth://totp/..."}
+# 把 otp_secret 录进验证器 App，用它算出的六位码登录：
+TOKEN=$(curl -s -X POST localhost:8080/api/auth/login \
+  -d '{"username":"root","password":"root-pw-123","otp_code":"123456"}' | jq -r .token)
+# 2) 建 Share（先要有 pool）并上传 / 下载
+curl -X POST localhost:8080/api/shares -H "Authorization: Bearer $TOKEN" \
+  -d '{"name":"docs","pool_id":1}'
+curl -X PUT --data-binary @f.bin -H "Authorization: Bearer $TOKEN" \
+  'localhost:8080/api/shares/1/files?path=/f.bin'
+curl -H "Authorization: Bearer $TOKEN" 'localhost:8080/api/shares/1/files?path=/f.bin' -o out.bin
+# 3) 回收站
+curl -H "Authorization: Bearer $TOKEN" localhost:8080/api/shares/1/recycle
+```
+
 ## 文件协议（SMB / SFTP / WebDAV）
 
 三个协议服务都接 `internal/token` 的 access token 认证、以 `internal/vfs` 为文件系统；
 真正决定能读写什么的是 `share_users` 里的授权，而不是协议层的共享权限。
+
+加密 Share 只要已经被管理员解锁（密钥在进程内存里），这三个协议同样能读写它——
+密钥来自 `pool.Keyring`，不需要各自再传口令。
 
 其中 **SMB 与 SFTP 各自监听一个端口**（见下），**WebDAV 不额外占端口**：它挂在 HTTP API
 服务上（同一个端口、默认 `/dav` 前缀），见下面 WebDAV 一节。
 
 ### 启用与配置
 
-端口存在 `settings` 表里，**为空表示不启用**——445 / 22 是特权端口，默认关掉才能让普通用户
-直接 `go run ./cmd/zenofs` 跑起来：
+SMB 的端口存在 `settings` 表里，**为空表示不启用**——445 是特权端口，默认关掉才能让普通用户
+直接 `go run ./cmd/zenofs` 跑起来；SFTP 默认就监听 **2222**（非特权端口，不用 root），
+WebDAV 默认挂在 HTTP 服务上：
 
 | 配置项 | 默认 | 说明 |
 |---|---|---|
 | `SMB_PORT` | 空（不启用） | 例如 `1445`；标准端口 `445` 需要 root |
 | `SMB_NETBIOS_NAME` | `ZENOFS` | NTLM TargetInfo 里对客户端可见的服务端名 |
-| `SFTP_PORT` | 空（不启用） | 例如 `2222`；标准端口 `22` 需要 root |
+| `SFTP_PORT` | `2222` | 默认监听 2222（非特权端口，不用 root）；设为 `off` / `-` / `0` 关闭，改成 `22` 则需要 root |
 | `SFTP_HOST_KEY_FILE` | 空 | 外部 SSH 主机私钥（PEM）；为空时用自动生成并持久化在 `settings.SFTP_HOST_KEY` 的 ed25519 密钥 |
 | `WEBDAV_PREFIX` | `/dav` | WebDAV 挂在 HTTP API 服务上的前缀；`off` 或 `-` 表示关闭 |
 
@@ -380,10 +583,16 @@ func firstErr(errs []error) error
 
 ### SFTP
 
+- **默认监听 2222**（`sftp.DefaultPort`）：非特权端口，`go run ./cmd/zenofs` 直接就能用；
+  想收回就设 `SFTP_PORT=off`。
 - 登录后的根目录就是该用户可见的 Share 列表：`/<share>/...`（`vfs.RootFS`）。
 - 两种认证都支持：SSH 公钥（按 `fingerprint` 匹配）与"用户名 + token"口令。
 - 打开 / 读写 / 列目录 / 改名 / 删除 / mkdir / statvfs 都翻译成 vfs 调用
   （`internal/sftp/handlers.go`），vfs 错误翻成 `syscall.Errno`，由 pkg/sftp 转成客户端的 `SSH_FX_*`。
+
+```bash
+sftp -P 2222 alice@localhost   # 口令填 access token
+```
 
 ### WebDAV
 
@@ -414,24 +623,18 @@ macOS Finder 里"连接服务器"填 `http://<host>:8080/dav`，账号是 zenofs
 
 ### 凭证管理 API
 
-| 端点 | 说明 |
-|---|---|
-| `POST /api/users/{id}/tokens` | 生成一条随机 token；响应里的 `token` 是明文，**只返回这一次** |
-| `GET /api/users/{id}/tokens?kind=secret\|public_key` | 列出凭证（只有元数据，永不回传摘要） |
-| `POST /api/users/{id}/pubkeys` | 注册一条 SFTP 公钥（`public_key` 用 authorized_keys 行格式） |
-| `DELETE /api/tokens/{id}` | 吊销凭证（硬删除，立即失效） |
-
-请求体里的 `expires_at` 是 Unix 秒，`0` 或省略表示永不过期。
-
-```bash
-curl -X POST localhost:8080/api/users/1/tokens -d '{"name":"laptop"}'
-# => {"id":1,...,"token":"<明文，仅此一次>"}
-```
+生成 / 列出 / 吊销访问凭证用 HTTP API 里那组端点（`POST /api/users/{id}/tokens` 等，
+见上面「访问凭证」一节）——它们同样要 Bearer JWT。token 明文只在创建响应里返回一次，
+`expires_at` 是 Unix 秒（`0` 或省略表示永不过期）。
 
 ## 约定
 
 - 错误一律用 `internal/errs` 的 `ZenoError`（数值 `Code` + 字符串 `StrCode` + `InnerErr`）；
-  API 层把 `ZenoError` 映射为 400 + 结构化 JSON，其余 error 映射为 500。
+  API 层按错误码选 HTTP 状态（401 认证 / 403 权限 / 404 不存在 / 409 冲突，其余 400），
+  响应体是结构化 JSON，其它 error 映射为 500。
+- **API 鉴权**：除 `/api/auth/bootstrap`、`/api/auth/login` 与 `/dav`（WebDAV 走自己的
+  Basic token）之外，所有端点都要 `Authorization: Bearer <JWT>`；文件与 Share 的读写一律以
+  `share_users` 授权为准（管理员不例外），没授权的 Share 按不存在处理（404）。
 - **凭证只存单向摘要**：token 明文只出现在创建响应里一次；`access_tokens.token_hash`（BLAKE3）
   与 `nt_hash`（MD4/UTF-16LE，NTLM 必需）都不可逆，任何接口都不回传这两个字段。
 - `internal/vfs` 的 POSIX 哨兵错误（`ErrNotExist` / `ErrPermission` / `ErrCrossDevice` …）本身就是

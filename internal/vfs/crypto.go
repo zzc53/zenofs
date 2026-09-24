@@ -11,6 +11,7 @@ import (
 	"github.com/zzc53/zenofs/internal/db"
 	"github.com/zzc53/zenofs/internal/errs"
 	"github.com/zzc53/zenofs/internal/hash"
+	"github.com/zzc53/zenofs/internal/pool"
 	"golang.org/x/crypto/pbkdf2"
 )
 
@@ -84,7 +85,29 @@ const (
 	verifyLen = 32
 	// nonceLen 是 AES-GCM 的标准 nonce 长度。
 	nonceLen = 12
+	// gcmTagLen 是 AES-GCM 的认证标签长度（crypto/cipher 的 GCM 固定 16 字节）。
+	gcmTagLen = 16
 )
+
+// sliceOverheadFor 估算一个切片编码后会比明文多出多少字节（取上界，宁可多留一点）。
+//
+// 为什么需要它：写进池的是**编码后**的字节，而池会拒绝超过 chunk 上限的块。
+// 切片大小必须从池的上限里扣掉这部分余量，否则"文件大小正好是切片整数倍"时，
+// 满切片会被存储层以 CHUNK_SIZE_EXCEED 拒收。
+//
+//   - 压缩：zstd 对不可压缩数据（随机字节、已经压过的文件）不会变小，反而要加帧头与
+//     块头；参照 ZSTD 的官方上界（膨胀约 size/256），再留 64 字节给帧头。
+//   - 加密：密文前面有 nonce(12)，尾部有认证标签(16)。
+func sliceOverheadFor(size int64, comp, enc int8) int64 {
+	var n int64
+	if comp == CompressionZstd {
+		n += size/256 + 64
+	}
+	if enc == EncryptionAESGCM {
+		n += nonceLen + gcmTagLen
+	}
+	return n
+}
 
 // ---------------------------------------------------------------
 // 口令与密钥
@@ -120,24 +143,22 @@ func (fs *ShareFS) SetPassword(password string) error {
 
 // UsePassword 用口令派生密钥并打开该 Share 的加密；口令不对返回 ErrPermission。
 // 未启用加密的 Share 无需提供口令，直接成功。
+//
+// 这是**挂载实例级**的密钥，只影响这一个 ShareFS。要让整个进程都解锁该 Share
+// （LUKS 式，所有协议共用同一份密钥），用 UnlockShare。
 func (fs *ShareFS) UsePassword(password string) error {
 	if fs.share.Encryption == EncryptionNone {
 		return nil
 	}
-	blob := fs.share.EncryptionKeyHash
-	if len(blob) != saltLen+verifyLen {
-		return ErrInvalid // 还没有设置过口令
-	}
-	salt, want := blob[:saltLen], blob[saltLen:]
-	key := deriveKey(password, salt)
-	if !hash.Equal(key, want) {
-		return ErrPermission
+	key, err := verifyPassword(fs.share, password)
+	if err != nil {
+		return err
 	}
 	fs.key = key
 	return nil
 }
 
-// ClearKey 清除会话里的密钥。
+// ClearKey 清除挂载实例里的密钥（不动进程级密钥表，那要用 LockShare）。
 func (fs *ShareFS) ClearKey() {
 	for i := range fs.key {
 		fs.key[i] = 0
@@ -145,9 +166,23 @@ func (fs *ShareFS) ClearKey() {
 	fs.key = nil
 }
 
-// HasKey 报告当前会话是否已持有可用密钥。
+// HasKey 报告当前是否有可用密钥。
 func (fs *ShareFS) HasKey() bool {
-	return len(fs.key) == keyLen
+	return len(fs.keyBytes()) == keyLen
+}
+
+// keyBytes 返回当前可用的解密密钥。
+//
+// 优先级：挂载实例自己的（UsePassword / SetPassword 设的）→ 进程级密钥表里已解锁的
+// （UnlockShare 设的）。后者正是"管理员解锁一次，所有协议都能用"的落点。
+func (fs *ShareFS) keyBytes() []byte {
+	if len(fs.key) == keyLen {
+		return fs.key
+	}
+	if key, ok := fs.pm.Keys.Get(fs.share.Id); ok && len(key) == keyLen {
+		return key
+	}
+	return nil
 }
 
 // deriveKey 用 PBKDF2-HMAC-SHA256 从口令派生 AES-256 密钥。
@@ -155,12 +190,13 @@ func deriveKey(password string, salt []byte) []byte {
 	return pbkdf2.Key([]byte(password), salt, pbkdf2Iter, keyLen, sha256.New)
 }
 
-// aead 返回绑定当前会话密钥的 AES-256-GCM。
+// aead 返回绑定当前密钥的 AES-256-GCM。
 func (fs *ShareFS) aead() (cipher.AEAD, error) {
-	if !fs.HasKey() {
+	key := fs.keyBytes()
+	if len(key) != keyLen {
 		return nil, ErrEncrypted
 	}
-	block, err := aes.NewCipher(fs.key)
+	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, errs.FromError(err, errs.ECODE_CRYPTO_ERROR, errs.ESTR_CRYPTO_ERROR)
 	}
@@ -297,4 +333,53 @@ func (fs *ShareFS) decryptSlice(stored []byte, algo int8) ([]byte, error) {
 	default:
 		return nil, ErrNotSupported
 	}
+}
+
+// ---------------------------------------------------------------
+// 进程级解锁（LUKS 式 open / close）
+// ---------------------------------------------------------------
+
+// UnlockShare 用口令解锁一个启用了加密的 Share：校验通过后把派生密钥放进进程级
+// 密钥表（pm.Keys），此后所有协议（HTTP API / WebDAV / SMB / SFTP）都能读写它，
+// 直到 LockShare 或进程退出——密钥只在内存里，不落库，重启后要重新解锁。
+//
+// 口令不对返回 ErrPermission；Share 没启用加密、或还没设置过口令返回 ErrInvalid。
+func UnlockShare(pm *pool.PoolManager, share db.Share, password string) error {
+	if share.Encryption == EncryptionNone {
+		return ErrInvalid
+	}
+	key, err := verifyPassword(share, password)
+	if err != nil {
+		return err
+	}
+	pm.Keys.Set(share.Id, key)
+	return nil
+}
+
+// LockShare 丢弃某个 Share 在内存里的密钥（并把字节清零），类似 LUKS close。
+//
+// 已经在读写的句柄会随即失败，所以调用方要保证此刻没有正在进行的操作。
+func LockShare(pm *pool.PoolManager, shareID int64) {
+	pm.Keys.Delete(shareID)
+}
+
+// ShareUnlocked 报告某个 Share 的密钥当前是否在内存里。
+func ShareUnlocked(pm *pool.PoolManager, shareID int64) bool {
+	key, ok := pm.Keys.Get(shareID)
+	return ok && len(key) == keyLen
+}
+
+// verifyPassword 校验口令并返回派生密钥。
+// 口令不对返回 ErrPermission；校验值缺失或长度不对返回 ErrInvalid（还没设置过口令）。
+func verifyPassword(share db.Share, password string) ([]byte, error) {
+	blob := share.EncryptionKeyHash
+	if len(blob) != saltLen+verifyLen {
+		return nil, ErrInvalid
+	}
+	salt, want := blob[:saltLen], blob[saltLen:]
+	key := deriveKey(password, salt)
+	if !hash.Equal(key, want) {
+		return nil, ErrPermission
+	}
+	return key, nil
 }

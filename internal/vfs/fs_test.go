@@ -404,7 +404,7 @@ func TestQuotaExceeded(t *testing.T) {
 	env, pm := newEnv(t)
 	p := env.NewPool("p", 2, 1, 8192)
 	fs, _ := newShareFS(t, env, pm, p.Id, testutil.ShareOpts{
-		Name: "q", UserID: 1, Permission: db.ShareWrite, QuotaMB: 1, SliceSizeKB: 512,
+		Name: "q", UserID: 1, Permission: db.ShareWrite, QuotaMB: 1,
 	})
 
 	f, err := fs.Create(t.Context(), "/big.bin", 0644)
@@ -532,9 +532,9 @@ func TestOpenFlagsBehaviour(t *testing.T) {
 
 func TestSparseFileReadsZeros(t *testing.T) {
 	env, pm := newEnv(t)
-	p := env.NewPool("p", 2, 1, 8192)
+	p := env.NewPool("p", 2, 1, 512) // chunk size = 切片大小
 	fs, share := newShareFS(t, env, pm, p.Id, testutil.ShareOpts{
-		Name: "sparse", UserID: 1, Permission: db.ShareWrite, SliceSizeKB: 512,
+		Name: "sparse", UserID: 1, Permission: db.ShareWrite,
 	})
 	ctx := t.Context()
 

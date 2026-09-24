@@ -88,7 +88,6 @@ type ShareOpts struct {
 	Name        string
 	UserID      int64 // 授权给哪个用户；0 表示不写 share_users（用来造"别人的 Share"）
 	Permission  db.SharePermission
-	SliceSizeKB int64 // 0 → 1024
 	QuotaMB     int64
 	Compression int8
 	Encryption  int8
@@ -97,14 +96,10 @@ type ShareOpts struct {
 // NewShare 建一条 Share 行；UserID 非 0 时同时写入 share_users 授权。
 func (e *Env) NewShare(poolId int64, o ShareOpts) db.Share {
 	e.T.Helper()
-	if o.SliceSizeKB == 0 {
-		o.SliceSizeKB = 1024
-	}
 	s := db.Share{
 		Name:        o.Name,
 		PoolId:      poolId,
 		Quota:       o.QuotaMB,
-		SliceSize:   o.SliceSizeKB,
 		Compression: o.Compression,
 		Encryption:  o.Encryption,
 		CreatedBy:   1,

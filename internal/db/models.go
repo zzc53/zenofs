@@ -206,29 +206,37 @@ const (
 type InodeEventType int8
 
 const (
-	InodeCreated InodeEventType = iota // 0 — 创建
-	InodeRenamed                       // 1 — 改名
-	InodeMoved                         // 2 — 移动
-	InodeDeleted                       // 3 — 删除
+	InodeCreated  InodeEventType = iota // 0 — 创建
+	InodeRenamed                        // 1 — 改名
+	InodeMoved                          // 2 — 移动
+	InodeDeleted                        // 3 — 删除（进回收站）
+	InodeRestored                       // 4 — 从回收站恢复
 )
 
 // User 系统用户。
+//
+// 登录要过两关：bcrypt 校验密码，再用 TOTP（SHA-1 / 30 秒 / 6 位）校验验证码。
+// OTPSecret 是 base32 密钥，只在创建/重置时明文出现一次，之后只用于算码。
 type User struct {
 	Id           int64    `gorm:"primaryKey"`
 	Username     string   `gorm:"uniqueIndex;not null"`
 	PasswordHash string   `gorm:"not null"`
+	OTPSecret    string   `gorm:"not null;default:''"` // TOTP 密钥（base32）；空表示该用户没有二次验证
 	Role         UserRole `gorm:"default:0"`
 	CreatedAt    int64    `gorm:"autoCreateTime"`
 }
 
 // Share 是用户可见的存储空间，绑定一个存储池。
 // 支持按需配置压缩、加密和空间配额。
+//
+// 文件切片大小**不在 Share 上**：它取自所属 Pool 的 ChunkSize（见 vfs 的 sliceSize）。
+// 切片大小决定文件怎么切成 chunk，读写偏移都依赖它，挂在池上才能保证一个池里
+// 所有共享用的是同一个值。
 type Share struct {
 	Id                int64  `gorm:"primaryKey"`
 	Name              string `gorm:"uniqueIndex;not null"`
 	PoolId            int64  `gorm:"index;not null"` // 绑定到哪个存储池
 	Quota             int64  `gorm:"default:0"`      // 空间配额上限（MB），0 表示不限制
-	SliceSize         int64  `gorm:"default:4096"`   // 文件切片大小（KB），决定 version chunk 的定长边界
 	Compression       int8   `gorm:"default:0"`      // 压缩算法（取值见 vfs.Compression*：0=无、1=zstd）
 	Encryption        int8   `gorm:"default:0"`      // 加密算法（取值见 vfs.Encryption*：0=无、1=AES-256-GCM）
 	EncryptionKeyHash []byte `gorm:"default:null"`   // 加密密钥校验值 / PBKDF2 salt（启用加密时非空）

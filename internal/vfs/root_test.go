@@ -20,7 +20,7 @@ func newRootEnv(t *testing.T) (*testutil.Env, *RootFS) {
 	p := env.NewPool("p", 2, 1, 8192)
 	env.NewShare(p.Id, testutil.ShareOpts{
 		Name: "work", UserID: 1, Permission: db.ShareWrite,
-		Compression: CompressionZstd, SliceSizeKB: 1024,
+		Compression: CompressionZstd,
 	})
 	env.NewShare(p.Id, testutil.ShareOpts{
 		Name: "pub", UserID: 1, Permission: db.ShareRead, Compression: CompressionZstd,

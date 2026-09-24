@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 
@@ -15,6 +16,10 @@ import (
 type PoolManager struct {
 	DbManager *db.DbManager
 	Handlers  []ChunkHandler
+
+	// Keys 是进程级的 Share 解锁密钥表（只在内存里，见 keyring.go）。
+	// 加密 Share 要先用口令解锁，之后所有协议都能通过它拿到密钥。
+	Keys *Keyring
 }
 
 // New 创建 PoolManager。
@@ -23,6 +28,7 @@ func New(dbManager *db.DbManager, handlers []ChunkHandler) *PoolManager {
 	return &PoolManager{
 		DbManager: dbManager,
 		Handlers:  handlers,
+		Keys:      NewKeyring(),
 	}
 }
 
@@ -100,8 +106,22 @@ func (p *PoolManager) AddDisk(poolId int64, path string, diskBackend int8, diskT
 
 	var disk db.Disk
 
-	// Cache 盘不需要 stripe 预分配，直接创建并返回
+	// Cache 盘只需要一条记录，不参与条带化。
+	// 但它要求池里**已经有数据盘**：缓存存的只是读副本，没有数据盘就没有东西可缓存，
+	// 先加缓存盘只会得到一个永远用不上的盘。
 	if diskType == int8(db.CacheDisk) {
+		if _, err := p.GetPool(poolId); err != nil {
+			return nil, err
+		}
+		var striped int64
+		if err := p.DbManager.DB.Model(&db.Disk{}).
+			Where("pool_id = ? AND type = ?", poolId, db.DataDisk).Count(&striped).Error; err != nil {
+			return nil, errs.DBQuery(err)
+		}
+		if striped == 0 {
+			return nil, errs.New(errs.ECODE_POOL_BAD, errs.ESTR_POOL_BAD,
+				"add a data disk before adding a cache disk", fmt.Sprintf("%d", poolId))
+		}
 		disk = db.Disk{
 			PoolId:  poolId,
 			Path:    path,
@@ -138,6 +158,11 @@ func (p *PoolManager) AddDisk(poolId int64, path string, diskBackend int8, diskT
 			return errs.DBQuery(err1)
 		}
 		if addParity {
+			// 池里必须先有数据分片：只加 parity 的话没有东西可保护（RS 的 data 分片数为 0）。
+			if existingPool.DataShards == 0 {
+				return errs.New(errs.ECODE_POOL_BAD, errs.ESTR_POOL_BAD,
+					"add a data disk before adding parity", fmt.Sprintf("%d", poolId))
+			}
 			existingPool.ParityShards += 1
 			chunkType = db.ParityChunk
 			idx = existingPool.ParityShards - 1
@@ -182,6 +207,52 @@ func (p *PoolManager) AddDisk(poolId int64, path string, diskBackend int8, diskT
 		}
 	}
 	return &disk, nil
+}
+
+// DeleteCacheDisk 删除一块缓存盘：连同盘上的缓存文件与 read_caches 记录一起清掉。
+//
+// 只允许删**缓存盘**：数据盘（含 parity 位）是唯一数据副本，删掉会丢数据，
+// 那种情况应该走"下线 / 换盘 + 重建"的流程。
+//
+// 删除是安全的：读路径在缓存文件读不到时会自动回退到源盘（见 ReadChunks），
+// 所以即使此刻正好有请求命中这块盘的缓存，也只是多一次回退。
+// 返回从库里移除的缓存记录数。
+func (p *PoolManager) DeleteCacheDisk(diskId int64) (int, error) {
+	var disk db.Disk
+	err := p.DbManager.DB.First(&disk, diskId).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return 0, errs.New(errs.ECODE_DISK_NOT_FOUND, errs.ESTR_DISK_NOT_FOUND,
+			"disk not found", strconv.FormatInt(diskId, 10))
+	}
+	if err != nil {
+		return 0, errs.DBQuery(err)
+	}
+	if disk.Type != db.CacheDisk {
+		return 0, errs.New(errs.ECODE_DISK_BAD_TYPE, errs.ESTR_DISK_BAD_TYPE,
+			"only cache disks can be deleted", strconv.FormatInt(diskId, 10))
+	}
+
+	var entries []db.ReadCache
+	if err := p.DbManager.DB.Where("disk_id = ?", diskId).Find(&entries).Error; err != nil {
+		return 0, errs.DBQuery(err)
+	}
+
+	// 先删文件、再删记录：反过来就找不到文件了。删文件是尽力而为的（失败只记日志），
+	// 残留文件不影响正确性——盘记录没了就不会再被引用。
+	p.deleteCacheFiles(entries)
+
+	if err := p.DbManager.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("disk_id = ?", diskId).Delete(&db.ReadCache{}).Error; err != nil {
+			return errs.DBQuery(err)
+		}
+		if err := tx.Delete(&db.Disk{}, diskId).Error; err != nil {
+			return errs.DBQuery(err)
+		}
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+	return len(entries), nil
 }
 
 // OfflinePool 标记 pool 为 Offline，暂停所有读写操作。

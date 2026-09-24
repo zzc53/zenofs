@@ -14,9 +14,11 @@ import (
 func newSliced(t *testing.T) (*testutil.Env, *ShareFS, db.Share) {
 	t.Helper()
 	env, pm := newEnv(t)
-	p := env.NewPool("p", 2, 1, 8192)
+	// 池的 chunk size 就是这个共享的切片大小（见 vfs.sliceSize），这里用 512KB
+	// 是为了让下面的断言能精确落在切片边界上。
+	p := env.NewPool("p", 2, 1, 512)
 	fs, share := newShareFS(t, env, pm, p.Id, testutil.ShareOpts{
-		Name: "s", UserID: 1, Permission: db.ShareWrite, SliceSizeKB: 512,
+		Name: "s", UserID: 1, Permission: db.ShareWrite,
 	})
 	return env, fs, share
 }

@@ -35,7 +35,7 @@ func TestWebDAVMountedOnSameRouter(t *testing.T) {
 func TestWebDAVDisabledByOption(t *testing.T) {
 	env := testutil.New(t)
 	pm := pool.New(env.DB, []pool.ChunkHandler{pool.NewLocalChunkHandler()})
-	srv := httptest.NewServer(NewRouter(pm, token.NewManager(env.DB), RouterOptions{WebDAVPrefix: "off"}))
+	srv := httptest.NewServer(NewRouter(Options{PoolManager: pm, Tokens: token.NewManager(env.DB), WebDAVPrefix: "off"}))
 	t.Cleanup(srv.Close)
 
 	resp := do(t, "PROPFIND", srv.URL+"/dav/", nil)
@@ -57,7 +57,7 @@ func TestWebDAVDisabledByOption(t *testing.T) {
 func TestWebDAVCustomPrefix(t *testing.T) {
 	env := testutil.New(t)
 	pm := pool.New(env.DB, []pool.ChunkHandler{pool.NewLocalChunkHandler()})
-	srv := httptest.NewServer(NewRouter(pm, token.NewManager(env.DB), RouterOptions{WebDAVPrefix: "files"}))
+	srv := httptest.NewServer(NewRouter(Options{PoolManager: pm, Tokens: token.NewManager(env.DB), WebDAVPrefix: "files"}))
 	t.Cleanup(srv.Close)
 
 	resp := do(t, "PROPFIND", srv.URL+"/files/", nil)

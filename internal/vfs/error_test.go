@@ -114,7 +114,7 @@ func TestVFSErrorsCarryCodesFromRealOperations(t *testing.T) {
 	}
 
 	quotaFS, _ := newShareFS(t, env, pm, share.PoolId, testutil.ShareOpts{
-		Name: "quota", UserID: 1, Permission: db.ShareWrite, QuotaMB: 1, SliceSizeKB: 512,
+		Name: "quota", UserID: 1, Permission: db.ShareWrite, QuotaMB: 1,
 	})
 
 	tests := []struct {

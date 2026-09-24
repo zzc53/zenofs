@@ -216,7 +216,6 @@ func sameMount(fs *ShareFS, share db.Share, perm db.SharePermission) bool {
 		cur.Name == share.Name &&
 		cur.PoolId == share.PoolId &&
 		cur.Quota == share.Quota &&
-		cur.SliceSize == share.SliceSize &&
 		cur.Compression == share.Compression &&
 		cur.Encryption == share.Encryption &&
 		bytes.Equal(cur.EncryptionKeyHash, share.EncryptionKeyHash)

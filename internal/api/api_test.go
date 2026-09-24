@@ -7,25 +7,58 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
+	"github.com/zzc53/zenofs/internal/auth"
 	"github.com/zzc53/zenofs/internal/db"
+	"github.com/zzc53/zenofs/internal/otp"
 	"github.com/zzc53/zenofs/internal/pool"
 	"github.com/zzc53/zenofs/internal/testutil"
 	"github.com/zzc53/zenofs/internal/token"
 )
 
-// newTestServer 起一个真实的 chi 路由 + 临时库 + 本地盘 handler。
+// testAdminToken 是 newTestServer 里管理员登录后拿到的 JWT，do() 会自动带上。
+// 同一个包里的测试默认串行执行（都没用 t.Parallel），所以包级变量是安全的。
+var testAdminToken string
+
+// newTestServer 起一个真实的 HTTP 服务：临时库 + 本地盘 handler + 已登录的管理员。
 func newTestServer(t *testing.T) (*testutil.Env, *httptest.Server) {
 	t.Helper()
 	env := testutil.New(t)
 	pm := pool.New(env.DB, []pool.ChunkHandler{pool.NewLocalChunkHandler()})
-	srv := httptest.NewServer(NewRouter(pm, token.NewManager(env.DB), RouterOptions{}))
+	authMgr, err := auth.NewManager(env.DB)
+	if err != nil {
+		t.Fatalf("auth.NewManager: %v", err)
+	}
+	srv := httptest.NewServer(NewRouter(Options{
+		PoolManager: pm,
+		Tokens:      token.NewManager(env.DB),
+		Auth:        authMgr,
+	}))
 	t.Cleanup(srv.Close)
+
+	// 造一个管理员并登录：do() 会自动带它的 JWT
+	secret, err := otp.GenerateSecret()
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, err := otp.Code(secret, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := authMgr.Bootstrap("root", "root-pw-123", secret, code); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+	adminToken, _, err := authMgr.Login("root", "root-pw-123", code)
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	testAdminToken = adminToken
 	return env, srv
 }
 
-// do 发一个请求，body 为 nil 时不带请求体。
-func do(t *testing.T, method, url string, body []byte) *http.Response {
+// newRequest 造一个请求；body 为 nil 时不带请求体。
+func newRequest(t *testing.T, method, url string, body []byte) *http.Request {
 	t.Helper()
 	var r io.Reader
 	if body != nil {
@@ -35,11 +68,31 @@ func do(t *testing.T, method, url string, body []byte) *http.Response {
 	if err != nil {
 		t.Fatal(err)
 	}
+	return req
+}
+
+// send 发送请求，失败即 Fatal。
+func send(t *testing.T, req *http.Request) *http.Response {
+	t.Helper()
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatalf("%s %s: %v", method, url, err)
+		t.Fatalf("%s %s: %v", req.Method, req.URL, err)
 	}
 	return resp
+}
+
+// do 发一个带管理员 JWT 的请求。
+func do(t *testing.T, method, url string, body []byte) *http.Response {
+	t.Helper()
+	req := newRequest(t, method, url, body)
+	req.Header.Set("Authorization", "Bearer "+testAdminToken)
+	return send(t, req)
+}
+
+// doNoAuth 发一个不带认证头的请求（用于测试 401、bootstrap 与登录）。
+func doNoAuth(t *testing.T, method, url string, body []byte) *http.Response {
+	t.Helper()
+	return send(t, newRequest(t, method, url, body))
 }
 
 // decode 把响应体解析成 map；同时关闭 body。

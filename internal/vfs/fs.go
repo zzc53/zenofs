@@ -4,8 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"log"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/zzc53/zenofs/internal/db"
@@ -15,8 +17,9 @@ import (
 )
 
 const (
-	// defaultSliceSize 是 Share.SliceSize 缺省时的切片大小（4MB）。
+	// defaultSliceSize 是读不到 Pool 配置时的兜底切片大小（4MB）。
 	defaultSliceSize = 4 * 1024 * 1024
+
 	// maxSymlinkDepth 是解析符号链接的最大跳数。
 	maxSymlinkDepth = 16
 	// maxPathDepth 是反推路径时向上遍历的最大层数，用于兜住异常数据形成的环。
@@ -39,6 +42,10 @@ type ShareFS struct {
 
 	// key 是解密该 Share 的密钥，仅在启用加密且用户已提供口令时非空。
 	key []byte
+
+	// sliceOnce/sliceBytes 缓存"从所属 Pool 读来的切片大小"（见 sliceSize）。
+	sliceOnce  sync.Once
+	sliceBytes int64
 }
 
 var _ FileSystem = (*ShareFS)(nil)
@@ -51,12 +58,30 @@ func NewShareFS(pm *pool.PoolManager, share db.Share, userID int64, perm db.Shar
 // Share 返回当前挂载的 Share 元数据。
 func (fs *ShareFS) Share() db.Share { return fs.share }
 
-// sliceSize 返回该 Share 的切片大小（字节），即 version chunk 的定长边界。
+// sliceSize 返回这个 Share 的切片大小（字节）——也就是一个 version chunk 的定长边界。
+//
+// 它直接取自所属 Pool 的 ChunkSize：Share 上不再单独配置。切片大小决定读写偏移，
+// 同一池内必须全局一致，所以挂在池上；结果只查一次库、缓存复用。
 func (fs *ShareFS) sliceSize() int64 {
-	if fs.share.SliceSize <= 0 {
-		return defaultSliceSize
-	}
-	return fs.share.SliceSize * 1024
+	fs.sliceOnce.Do(func() {
+		fs.sliceBytes = defaultSliceSize
+		var pool db.Pool
+		if err := fs.pm.DbManager.DB.First(&pool, fs.share.PoolId).Error; err != nil {
+			log.Printf("vfs: 读 pool %d 的 chunk size 失败，切片大小回退到 %d 字节: %v",
+				fs.share.PoolId, defaultSliceSize, err)
+			return
+		}
+		if size := pool.ChunkSize * 1024; size > 0 {
+			// 写进池的是压缩 + 加密之后的字节，它必须仍然不超过池的 chunk 上限，
+			// 所以切片要从上限里扣掉编码开销（见 sliceOverheadFor）。
+			// 未压缩未加密时开销为 0，切片就精确等于池的 chunk size。
+			if overhead := sliceOverheadFor(size, fs.share.Compression, fs.share.Encryption); size > overhead {
+				size -= overhead
+			}
+			fs.sliceBytes = size
+		}
+	})
+	return fs.sliceBytes
 }
 
 // up 判断当前挂载是否具备写权限。

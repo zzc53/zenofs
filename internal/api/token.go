@@ -68,7 +68,7 @@ func respondTokenErr(w http.ResponseWriter, err error) {
 //
 // 凭证绑定 zenofs 用户（users.id），可带过期时间；一个 token 可以登所有协议
 // （SMB / SFTP / WebDAV），公钥只用于 SFTP。
-func registerTokenRoutes(r chi.Router, tokens *token.Manager) {
+func (s *server) registerTokenRoutes(r chi.Router) {
 	// POST /api/users/{id}/tokens —— 生成一条随机 token
 	// 请求：{"name": "laptop", "expires_at": 0}
 	// 响应：{"id":..., "token":"<明文，仅此一次>", ...}
@@ -88,7 +88,7 @@ func registerTokenRoutes(r chi.Router, tokens *token.Manager) {
 			badRequest(w, "expires_at 不能为负数")
 			return
 		}
-		plain, tok, err := tokens.Create(userId, body.Name, body.ExpiresAt)
+		plain, tok, err := s.tokens.Create(userId, body.Name, body.ExpiresAt)
 		if err != nil {
 			respondTokenErr(w, err)
 			return
@@ -119,7 +119,7 @@ func registerTokenRoutes(r chi.Router, tokens *token.Manager) {
 			badRequest(w, "expires_at 不能为负数")
 			return
 		}
-		tok, err := tokens.CreatePublicKey(userId, body.Name, body.PublicKey, body.ExpiresAt)
+		tok, err := s.tokens.CreatePublicKey(userId, body.Name, body.PublicKey, body.ExpiresAt)
 		if err != nil {
 			respondTokenErr(w, err)
 			return
@@ -146,7 +146,7 @@ func registerTokenRoutes(r chi.Router, tokens *token.Manager) {
 			badRequest(w, "kind 只支持 secret / public_key")
 			return
 		}
-		list, err := tokens.List(userId, kind)
+		list, err := s.tokens.List(userId, kind)
 		if err != nil {
 			respondTokenErr(w, err)
 			return
@@ -164,7 +164,7 @@ func registerTokenRoutes(r chi.Router, tokens *token.Manager) {
 		if !ok {
 			return
 		}
-		if err := tokens.Revoke(id); err != nil {
+		if err := s.tokens.Revoke(id); err != nil {
 			respondTokenErr(w, err)
 			return
 		}

@@ -49,6 +49,23 @@ const (
 	ECODE_TOKEN_NOT_FOUND = 32 // 凭证不存在
 	ECODE_TOKEN_BAD_KEY   = 33 // SSH 公钥格式非法
 	ECODE_TOKEN_BAD_USER  = 34 // 归属用户不存在
+
+	// 认证与用户/Share 管理（internal/auth、internal/api）的错误。
+	ECODE_OTP_INVALID       = 35 // 二次验证码错误
+	ECODE_OTP_BAD_SECRET    = 36 // OTP 密钥格式非法
+	ECODE_AUTH_BAD_LOGIN    = 37 // 用户名或密码错误
+	ECODE_AUTH_NO_TOKEN     = 38 // 缺少 Bearer token
+	ECODE_AUTH_BAD_TOKEN    = 39 // token 无效或已过期
+	ECODE_AUTH_NOT_ADMIN    = 40 // 需要管理员权限
+	ECODE_AUTH_DONE         = 41 // 系统里已有用户，不能再 bootstrap
+	ECODE_USER_EXIST        = 42 // 用户名已存在
+	ECODE_USER_NOT_FOUND    = 43 // 用户不存在
+	ECODE_USER_BAD          = 44 // 用户参数非法（用户名/密码/角色/验证码等）
+	ECODE_SHARE_NOT_FOUND   = 45 // Share 不存在
+	ECODE_SHARE_EXIST       = 46 // Share 名重复
+	ECODE_SHARE_BAD         = 47 // Share 参数非法
+	ECODE_RECYCLE_NOT_FOUND = 48 // 回收站里没有这个条目
+	ECODE_DISK_NOT_FOUND    = 49 // 磁盘不存在
 )
 
 // ── 错误码（字符串） ──
@@ -95,6 +112,23 @@ const (
 	ESTR_TOKEN_NOT_FOUND = "TOKEN_NOT_FOUND"
 	ESTR_TOKEN_BAD_KEY   = "TOKEN_BAD_KEY"
 	ESTR_TOKEN_BAD_USER  = "TOKEN_BAD_USER"
+
+	// 认证与用户/Share 管理（与 ECODE_* 一一对应）
+	ESTR_OTP_INVALID       = "OTP_INVALID"
+	ESTR_OTP_BAD_SECRET    = "OTP_BAD_SECRET"
+	ESTR_AUTH_BAD_LOGIN    = "AUTH_BAD_LOGIN"
+	ESTR_AUTH_NO_TOKEN     = "AUTH_NO_TOKEN"
+	ESTR_AUTH_BAD_TOKEN    = "AUTH_BAD_TOKEN"
+	ESTR_AUTH_NOT_ADMIN    = "AUTH_NOT_ADMIN"
+	ESTR_AUTH_DONE         = "AUTH_DONE"
+	ESTR_USER_EXIST        = "USER_EXIST"
+	ESTR_USER_NOT_FOUND    = "USER_NOT_FOUND"
+	ESTR_USER_BAD          = "USER_BAD"
+	ESTR_SHARE_NOT_FOUND   = "SHARE_NOT_FOUND"
+	ESTR_SHARE_EXIST       = "SHARE_EXIST"
+	ESTR_SHARE_BAD         = "SHARE_BAD"
+	ESTR_RECYCLE_NOT_FOUND = "RECYCLE_NOT_FOUND"
+	ESTR_DISK_NOT_FOUND    = "DISK_NOT_FOUND"
 )
 
 // ZenoError 是系统的标准错误类型，包含数值码、字符串码和上下文。

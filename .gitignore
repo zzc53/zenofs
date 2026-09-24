@@ -34,3 +34,8 @@ go.work.sum
 main
 vendor/
 .reasonix/
+
+# 前端构建依赖（构建产物在 internal/webui/dist，跟着仓库一起提交）
+web/node_modules/
+web/.vite/
+internal/webui/dist/

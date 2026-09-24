@@ -46,8 +46,11 @@ import (
 )
 
 const (
-	// DefaultPort 是 SFTP 的标准端口（22，监听它需要 root）。
-	DefaultPort = 22
+	// DefaultPort 是 SFTP 的默认监听端口。
+	//
+	// 用 2222 而不是标准的 22：22 是特权端口（要 root），2222 让普通用户
+	// 直接 `go run ./cmd/zenofs` 就能起一个可用的 SFTP 服务。
+	DefaultPort = 2222
 	// hostKeySetting 是 settings 表里保存自动生成主机密钥的键名。
 	hostKeySetting = "SFTP_HOST_KEY"
 	// extUserID 是认证成功后放进 ssh.Permissions.Extensions 的用户 id。
@@ -113,7 +116,7 @@ func New(pm *pool.PoolManager, tm *token.Manager, opts Options) (*Server, error)
 }
 
 // Start 开始监听（后台运行），返回实际监听地址。
-// addr 为空表示 ":22"；传 "127.0.0.1:0" 可以拿随机端口（测试用）。
+// addr 为空表示 ":2222"（见 DefaultPort）；传 "127.0.0.1:0" 可以拿随机端口（测试用）。
 func (s *Server) Start(addr string) (net.Addr, error) {
 	if addr == "" {
 		addr = fmt.Sprintf(":%d", DefaultPort)
