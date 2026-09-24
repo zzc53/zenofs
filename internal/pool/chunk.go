@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"path"
 	"strconv"
-	"sync"
 	"time"
 
 	cryptorand "crypto/rand"
@@ -53,6 +52,28 @@ func cryptoRandSeed() int64 {
 	return int64(binary.LittleEndian.Uint64(buf[:]))
 }
 
+// ---------------------------------------------------------------
+// 步骤 2：预分配 chunk 槽位
+// ---------------------------------------------------------------
+
+// getNewChunks 为 items 分配 chunk 槽位（AddChunks 的步骤 2：预分配）。
+//
+// 三个 Phase 在同一个事务中完成，尽量把 DB 往返压到最少：
+//
+//	Phase 1 — 复用已有的 Reserved data chunk
+//	  一次查询取出该 pool 中状态为 Reserved 的 data chunk slot（SKIP LOCKED 防止并发争抢），
+//	  优先填满，复用预留槽位、减少 stripe 碎片。
+//
+//	Phase 2 — 不够则新建 stripe
+//	  一次性批量创建所需的全部 stripe 行，再一次性批量创建对应的全部 chunk 行
+//	  （data + parity），磁盘通过 shuffle 均匀分布，路径一次批量生成。
+//
+//	Phase 3 — 激活复用的 Reserved chunk
+//	  对 Phase 1 取到的 slot 补上 size / hash 并置为 Allocated，
+//	  通过一次 upsert（INSERT ... ON CONFLICT(id) DO UPDATE）批量写回。
+//
+// 返回的 chunks 顺序与 items 一一对应（reserved 在前、新建在后），
+// 每条都已带自增 Id，可直接用于后续入队与写盘。
 func (p *PoolManager) getNewChunks(poolId int64, items []ChunkData) ([]db.Chunk, error) {
 	N := len(items)
 
@@ -66,8 +87,6 @@ func (p *PoolManager) getNewChunks(poolId int64, items []ChunkData) ([]db.Chunk,
 	if pool.Status != db.Online {
 		return nil, errs.New(errs.ECODE_POOL_OFFLINE, errs.ESTR_POOL_OFFLINE, "pool is offline", strconv.FormatInt(poolId, 10))
 	}
-
-	var chunks []db.Chunk
 
 	// ---------------------------------------------------------------
 	// 查询 pool 中所有在线的 data 盘，Phase 2 建新 stripe 时会用到。
@@ -89,20 +108,17 @@ func (p *PoolManager) getNewChunks(poolId int64, items []ChunkData) ([]db.Chunk,
 		}
 	}
 
-	// ---------------------------------------------------------------
-	// 以下三个 Phase 在同一个事务中执行，保证分配的原子性。
-	// ---------------------------------------------------------------
+	var chunks []db.Chunk
+
 	err = p.DbManager.DB.Transaction(func(tx *gorm.DB) error {
 		// ---------------------------------------------------------------
 		// Phase 1: 消费该 pool 中已预分配的 Reserved data chunks。
-		// 通过 JOIN stripes 表过滤出属于当前 pool 的 Reserved slot。
 		// 使用 SKIP LOCKED 防止并发写入时锁冲突（各自跳过已锁行）。
 		// ---------------------------------------------------------------
 		var reserved []db.Chunk
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
 			Model(&db.Chunk{}).
-			Select("chunks.*").
-			Where("status = ? AND chunks.type = ? AND pool_id = ?", db.ChunkReserved, db.DataChunk, poolId).
+			Where("status = ? AND type = ? AND pool_id = ?", db.ChunkReserved, db.DataChunk, poolId).
 			Limit(N).
 			Find(&reserved).Error; err != nil {
 			return errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
@@ -111,17 +127,17 @@ func (p *PoolManager) getNewChunks(poolId int64, items []ChunkData) ([]db.Chunk,
 		need := N - len(reserved)
 
 		// ---------------------------------------------------------------
-		// Phase 2: 如果 Phase 1 不够用，新建 stripe。
+		// Phase 2: 如果 Phase 1 不够用，批量新建 stripe 及其 chunk。
 		//
 		// 每个 stripe 包含 dataShards 个 data slot + parityShards 个 parity slot。
-		// 新创建的 data chunk 直接写入完整数据（status=Pending）并附带
-		// size 和 checksum，无需 Phase 3 二次更新。
-		// 磁盘分配通过 crypto/rand 种子 shuffle 实现负载均衡。
+		// 本次实际写入的 data chunk 直接填好 size / hash 并置为 Allocated；
+		// 其余 slot 保持 Reserved 供后续批次复用。
 		// ---------------------------------------------------------------
-		var newChunks []db.Chunk
+		newChunks := make([]db.Chunk, 0, need)
 		if need > 0 {
 			dataShards := int(pool.DataShards)
-			totalSlots := dataShards + int(pool.ParityShards)
+			parityShards := int(pool.ParityShards)
+			totalSlots := dataShards + parityShards
 			if totalSlots <= 0 {
 				return errs.New(errs.ECODE_POOL_BAD, errs.ESTR_POOL_BAD, "invalid stripe capacity",
 					fmt.Sprintf("data_shards=%d, parity_shards=%d", pool.DataShards, pool.ParityShards))
@@ -132,29 +148,38 @@ func (p *PoolManager) getNewChunks(poolId int64, items []ChunkData) ([]db.Chunk,
 					fmt.Sprintf("online=%d, need=%d", len(disks), totalSlots))
 			}
 
+			// 一次算出需要多少个 stripe
+			numStripes := (need + dataShards - 1) / dataShards
+
+			// 批量创建 stripe 行（GORM 会回填自增 Id）
+			newStripes := make([]db.Stripe, numStripes)
+			for i := range newStripes {
+				newStripes[i] = db.Stripe{PoolId: poolId}
+			}
+			if err := tx.Create(&newStripes).Error; err != nil {
+				return errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
+			}
+
+			// 一次性生成所有新 chunk 的路径
+			paths, err := generateChunkPaths(numStripes * totalSlots)
+			if err != nil {
+				return errs.FromError(err, errs.ECODE_CRYPTO_ERROR, errs.ESTR_CRYPTO_ERROR)
+			}
+
+			// 组装所有新 chunk 行
+			allNew := make([]db.Chunk, 0, numStripes*totalSlots)
 			remaining := need
-			globalNewIdx := 0
-			for remaining > 0 {
-				// 每次循环创建一个新的 stripe
-				batchSize := dataShards
+			newIdx := 0 // 新建部分在 items 中的偏移（从 len(reserved) 起）
+			for s := 0; s < numStripes; s++ {
+				batch := dataShards
 				if remaining < dataShards {
-					batchSize = remaining
+					batch = remaining
 				}
-
-				// 创建 stripe 行
-				stripe := db.Stripe{PoolId: poolId}
-				if err := tx.Create(&stripe).Error; err != nil {
-					return errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
-				}
-
 				// 对 disks 进行 shuffle，将 chunk 均匀分布到各磁盘
 				shuffled := append([]db.Disk{}, disks...)
 				mrand.New(mrand.NewSource(cryptoRandSeed())).Shuffle(len(shuffled), func(i, j int) {
 					shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
 				})
-
-				// 为 stripe 创建所有 chunk 行（data + parity）
-				allChunks := make([]db.Chunk, totalSlots)
 				for i := 0; i < totalSlots; i++ {
 					typ := db.ParityChunk
 					if i < dataShards {
@@ -163,57 +188,58 @@ func (p *PoolManager) getNewChunks(poolId int64, items []ChunkData) ([]db.Chunk,
 					status := db.ChunkReserved
 					var size int64
 					var hash []byte
-					if i < batchSize {
+					if i < batch {
 						// 本次 batch 中实际写入的 data chunk，直接填数据
 						status = db.ChunkAllocated
-						itemIdx := len(reserved) + globalNewIdx + i
+						itemIdx := len(reserved) + newIdx + i
 						size = int64(items[itemIdx].Size)
-						hash = items[itemIdx].Hash[:]
-					}
-					p, err := generateChunkPaths(1)
-					if err != nil {
-						return errs.FromError(err, errs.ECODE_CRYPTO_ERROR, errs.ESTR_CRYPTO_ERROR)
+						hash = items[itemIdx].Hash
 					}
 					idx := int64(i)
 					if i >= dataShards {
 						idx = int64(i - dataShards) // parity 独立编号从 0 开始
 					}
-					allChunks[i] = db.Chunk{
+					allNew = append(allNew, db.Chunk{
 						Status:   status,
-						Path:     p[0],
+						Path:     paths[len(allNew)],
 						DiskId:   shuffled[i].Id,
-						StripeId: stripe.Id,
-						PoolId:   stripe.PoolId,
+						StripeId: newStripes[s].Id,
+						PoolId:   poolId,
 						Size:     size,
 						Hash:     hash,
 						Type:     typ,
 						Index:    idx,
-					}
+					})
 				}
-				if err := tx.Create(&allChunks).Error; err != nil {
-					return errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
-				}
+				remaining -= batch
+				newIdx += batch
+			}
+			if err := tx.Create(&allNew).Error; err != nil {
+				return errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
+			}
 
-				// 收集本次批次的 data chunk 作为返回结果
-				for i := 0; i < batchSize; i++ {
-					newChunks = append(newChunks, allChunks[i])
+			// 收集本次实际分配到的 data chunk（按 items 顺序）
+			for i := range allNew {
+				if allNew[i].Type == db.DataChunk && allNew[i].Status == db.ChunkAllocated {
+					newChunks = append(newChunks, allNew[i])
 				}
-
-				remaining -= batchSize
-				globalNewIdx += batchSize
 			}
 		}
 
 		// ---------------------------------------------------------------
-		// Phase 3: 激活老的 Reserved chunks。
-		// 对于 Phase 1 拿到的 reserved chunks，补上 size、checksum 和
-		// 生成文件路径，更新状态为 Pending。
+		// Phase 3: 激活 Phase 1 复用的 Reserved chunks。
+		// 一次 upsert 批量补上 size / hash 并置为 Allocated。
 		// ---------------------------------------------------------------
-		for i := range reserved {
-			reserved[i].Status = db.ChunkAllocated
-			reserved[i].Size = items[i].Size
-			reserved[i].Hash = items[i].Hash
-			if err := tx.Save(&reserved[i]).Error; err != nil {
+		if len(reserved) > 0 {
+			for i := range reserved {
+				reserved[i].Status = db.ChunkAllocated
+				reserved[i].Size = int64(items[i].Size)
+				reserved[i].Hash = items[i].Hash
+			}
+			if err := tx.Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "id"}},
+				DoUpdates: clause.AssignmentColumns([]string{"status", "size", "hash"}),
+			}).Create(&reserved).Error; err != nil {
 				return errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
 			}
 		}
@@ -230,6 +256,88 @@ func (p *PoolManager) getNewChunks(poolId int64, items []ChunkData) ([]db.Chunk,
 	return chunks, nil
 }
 
+// ---------------------------------------------------------------
+// 步骤 3 / 5：write queue 入队
+// ---------------------------------------------------------------
+
+// createWriteQueue 批量插入 write queue 条目。
+func (p *PoolManager) createWriteQueue(entries []db.WriteQueue) error {
+	if err := p.DbManager.DB.Create(&entries).Error; err != nil {
+		return errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
+	}
+	return nil
+}
+
+// enqueueWriteIntents 批量记录写入意图（步骤 3，TaskPending）。
+// 作为 WAL 使用：进程崩溃后残留的 Pending 条目可用于恢复重写。
+func (p *PoolManager) enqueueWriteIntents(chunks []db.Chunk) error {
+	if len(chunks) == 0 {
+		return nil
+	}
+	entries := make([]db.WriteQueue, len(chunks))
+	for i, c := range chunks {
+		entries[i] = db.WriteQueue{
+			ChunkId:  c.Id,
+			StripeId: c.StripeId,
+			Status:   db.TaskPending,
+		}
+	}
+	return p.createWriteQueue(entries)
+}
+
+// enqueueWriteResults 批量记录写盘结果（步骤 5）。
+// writeErrs[i] 为 chunks[i] 的写盘错误，为 nil 记 TaskSuccess，否则记 TaskFail。
+// TaskSuccess 会驱动 parity worker 计算 RS 校验。
+func (p *PoolManager) enqueueWriteResults(chunks []db.Chunk, writeErrs []error) error {
+	if len(chunks) == 0 {
+		return nil
+	}
+	entries := make([]db.WriteQueue, len(chunks))
+	for i, c := range chunks {
+		status := db.TaskSuccess
+		if writeErrs[i] != nil {
+			status = db.TaskFail
+		}
+		entries[i] = db.WriteQueue{
+			ChunkId:  c.Id,
+			StripeId: c.StripeId,
+			Status:   status,
+		}
+	}
+	return p.createWriteQueue(entries)
+}
+
+// ---------------------------------------------------------------
+// 步骤 4：批量写盘
+// ---------------------------------------------------------------
+
+// writeChunkFiles 并发把每个 chunk 的数据写到其所在磁盘。
+// data[i] 对应 chunks[i]。返回与 chunks 等长的错误切片（成功为 nil）以及其中一个错误。
+func (p *PoolManager) writeChunkFiles(chunks []db.Chunk, data [][]byte, diskById map[int64]db.Disk) ([]error, error) {
+	writeErrs := parallelEach(len(chunks), 0, func(i int) error {
+		chk := chunks[i]
+		disk, ok := diskById[chk.DiskId]
+		if !ok {
+			return errs.New(errs.ECODE_DISK_OFFLINE, errs.ESTR_DISK_OFFLINE,
+				"disk not found", strconv.FormatInt(chk.DiskId, 10))
+		}
+		h := p.handlerFor(disk.Backend)
+		if h == nil {
+			return errs.New(errs.ECODE_FILE_WRITE, errs.ESTR_FILE_WRITE,
+				"no handler for backend", strconv.Itoa(int(disk.Backend)))
+		}
+		if err := h.Write(disk, chk.Path, data[i]); err != nil {
+			return errs.FromError(err, errs.ECODE_FILE_WRITE, errs.ESTR_FILE_WRITE)
+		}
+		return nil
+	})
+	return writeErrs, firstErr(writeErrs)
+}
+
+// ---------------------------------------------------------------
+// AddChunk / AddChunks
+// ---------------------------------------------------------------
+
 // AddChunk 兼容包装：单 chunk 写入。
 // 委托给 AddChunks 处理，返回第一个（也是唯一一个）chunk。
 func (p *PoolManager) AddChunk(poolId int64, bytes []byte) (*db.Chunk, error) {
@@ -242,22 +350,28 @@ func (p *PoolManager) AddChunk(poolId int64, bytes []byte) (*db.Chunk, error) {
 
 // AddChunks 批量写入 chunks，支持任意数量（1 ≤ N）。
 //
-// 分配策略（三个 Phase 在同一事务中执行）：
+// 入参 poolId 与数据列表，出参为分配到的 chunk 元数据（顺序与 dataList 一致）。
 //
-//	Phase 1 — 消费预分配的 Reserved chunks
-//	  查询当前 pool 中状态为 Reserved 的 data chunk slot（加 SKIP LOCKED），
-//	  尽量复用已有的预留槽位，减少 stripe 碎片。
+// 流程：
 //
-//	Phase 2 — 不够则建新 stripe
-//	  如果 Phase 1 不够用，创建新的 stripe 和对应的 chunk 行。
-//	  新 chunk 创建时直接写完成数据（status=Pending），无需 Phase 3 二次更新。
-//	  磁盘分配通过 shuffle 实现负载均衡。
+//	步骤 1 — 计算 size 和 hash
+//	  在事务外对每个 chunk 计算 BLAKE3 哈希与大小（纯 CPU，不占 DB）。
 //
-//	Phase 3 — 激活 old Reserved chunks
-//	  对 Phase 1 获取的 old reserved chunks，更新 size/checksum/path 并标记 Pending。
+//	步骤 2 — 预分配 chunks
+//	  从该 pool 中未分配的 Reserved data chunk 取用；不够则新建 stripe 和对应的
+//	  chunk 再取用。整段在一个事务里批量完成（见 getNewChunks），DB 往返最少。
 //
-// 事务提交后，事务外并发将实际数据写入磁盘。
-// 写入成功后标记 chunk 为 Dirty 并入队 WriteQueue，由 parity worker 异步计算 RS 校验。
+//	步骤 3 — 批量插入 write queue（Pending）
+//	  作为写入意图（WAL）记录，崩溃后可用于恢复重写。
+//
+//	步骤 4 — 批量写入文件
+//	  并发将数据写到各自磁盘。
+//
+//	步骤 5 — 批量插入 write queue（Success / Fail）
+//	  写盘结果记录；Success 会驱动 parity worker 计算 RS 校验。
+//
+// 写盘全部成功时返回 (chunks, nil)；存在失败时返回 (nil, 首个错误)。
+// 失败的 chunk 元数据保持已分配状态不动，由上层依据 Fail 记录重试。
 func (p *PoolManager) AddChunks(poolId int64, dataList [][]byte) ([]db.Chunk, error) {
 	// ---------------------------------------------------------------
 	// 前置校验：输入不能为空
@@ -272,9 +386,9 @@ func (p *PoolManager) AddChunks(poolId int64, dataList [][]byte) ([]db.Chunk, er
 	}
 
 	N := len(dataList)
+
 	// ---------------------------------------------------------------
-	// 预计算每个 chunk 的 BLAKE3 哈希和大小（在事务外计算）。
-	// 这样事务内部只需读写 DB，不占用大量内存。
+	// 步骤 1: 计算 size 和 hash（事务外）
 	// ---------------------------------------------------------------
 	items := make([]ChunkData, N)
 	for i, data := range dataList {
@@ -288,107 +402,42 @@ func (p *PoolManager) AddChunks(poolId int64, dataList [][]byte) ([]db.Chunk, er
 		}
 	}
 
-	// ---------------------------------------------------------------
-	// 预加载该 pool 下所有磁盘信息（事务外），
-	// 后续文件写入时需要根据 disk.Backend 匹配对应的 Writer。
-	// ---------------------------------------------------------------
+	// 预加载该 pool 下所有磁盘信息（写文件时按 disk.Backend 匹配 Writer）
 	diskById, err := p.getDiskMapByPoolId(poolId)
 	if err != nil {
 		return nil, err
 	}
 
+	// ---------------------------------------------------------------
+	// 步骤 2: 预分配 chunks
+	// ---------------------------------------------------------------
 	chunks, err := p.getNewChunks(poolId, items)
+	if err != nil {
+		return nil, err
+	}
 
 	// ---------------------------------------------------------------
-	// 事务提交后，并发将实际数据写入磁盘。
-	// 每个 chunk 启动一个 goroutine，通过 channel 收集写入结果。
+	// 步骤 3: 记录写入意图（write queue, Pending）
 	// ---------------------------------------------------------------
-	type writeResult struct {
-		idx int
-		err error
+	if err := p.enqueueWriteIntents(chunks); err != nil {
+		return nil, err
 	}
-	resultCh := make(chan writeResult, len(chunks))
-	var wg sync.WaitGroup
-	for i, c := range chunks {
-		wg.Add(1)
-		go func(idx int, disk db.Disk, relPath string, data []byte) {
-			defer wg.Done()
-			h := p.handlerFor(disk.Backend)
-			if h == nil {
-				resultCh <- writeResult{idx, errs.New(errs.ECODE_FILE_WRITE, errs.ESTR_FILE_WRITE,
-					"no handler for backend", strconv.Itoa(int(disk.Backend)))}
-				return
-			}
-			if err := h.Write(disk, relPath, data); err != nil {
-				resultCh <- writeResult{idx, errs.FromError(err, errs.ECODE_FILE_WRITE, errs.ESTR_FILE_WRITE)}
-			}
-		}(i, diskById[c.DiskId], c.Path, items[i].Data)
-	}
-	wg.Wait()
-	close(resultCh)
 
 	// ---------------------------------------------------------------
-	// 收集写入结果，处理部分失败的情况：
-	//   - 写入失败的 chunk → 标记 Error
-	//   - 写入成功的 chunk → 标记 Dirty，入队 WriteQueue 让 parity worker 处理
+	// 步骤 4: 批量写入文件
 	// ---------------------------------------------------------------
-	var firstErr error
-	var failedIdx []int
-	for r := range resultCh {
-		if r.err != nil {
-			failedIdx = append(failedIdx, r.idx)
-			if firstErr == nil {
-				firstErr = r.err
-			}
-		}
+	writeErrs, firstErr := p.writeChunkFiles(chunks, dataList, diskById)
+
+	// ---------------------------------------------------------------
+	// 步骤 5: 批量插入 write queue（Success / Fail）
+	// ---------------------------------------------------------------
+	if err := p.enqueueWriteResults(chunks, writeErrs); err != nil {
+		return nil, err
 	}
+
 	if firstErr != nil {
-		failed := make(map[int]bool, len(failedIdx))
-		for _, idx := range failedIdx {
-			failed[idx] = true
-		}
-		var errorIds, successIds []int64
-		for i, c := range chunks {
-			if failed[i] {
-				errorIds = append(errorIds, c.Id)
-			} else {
-				successIds = append(successIds, c.Id)
-			}
-		}
-		if len(errorIds) > 0 {
-
-		}
-		if len(successIds) > 0 {
-			var wq []db.WriteQueue
-			for i, c := range chunks {
-				if !failed[i] {
-					wq = append(wq, db.WriteQueue{ChunkId: c.Id, StripeId: c.StripeId})
-				}
-			}
-			p.DbManager.DB.Create(&wq)
-		}
 		return nil, firstErr
 	}
-
-	// ---------------------------------------------------------------
-	// 全部写入成功：标记所有 chunk 为 Dirty，批量入队 WriteQueue
-	// ---------------------------------------------------------------
-	ids := make([]int64, len(chunks))
-	for i, c := range chunks {
-		ids[i] = c.Id
-	}
-
-	writeEntries := make([]db.WriteQueue, len(chunks))
-	for i, c := range chunks {
-		writeEntries[i] = db.WriteQueue{
-			ChunkId:  c.Id,
-			StripeId: c.StripeId,
-		}
-	}
-	if err := p.DbManager.DB.Create(&writeEntries).Error; err != nil {
-		return nil, errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
-	}
-
 	return chunks, nil
 }
 
@@ -409,6 +458,10 @@ func generateChunkPaths(count int) ([]string, error) {
 	return stringArr, nil
 }
 
+// ---------------------------------------------------------------
+// WriteChunks
+// ---------------------------------------------------------------
+
 // WriteChunkItem 指定待写入的 chunk ID 和对应的数据。
 type WriteChunkItem struct {
 	ChunkId int64
@@ -417,12 +470,12 @@ type WriteChunkItem struct {
 
 // WriteChunks 向已分配的 chunk（通过 ChunkId）写入数据。
 //
-// 流程：
-//  1. 根据 chunkId 查出 chunk 及其所属 pool，校验 pool 在线
-//  2. 校验数据大小不超过 pool 的 chunk size
-//  3. 在事务中更新 chunk 元数据（size / checksum / path / status）
-//  4. 事务外并发写入磁盘
-//  5. 写入成功后标记 Dirty 并入队 WriteQueue
+// 流程与 AddChunks 保持一致：
+//  1. 计算 size 和 hash
+//  2. 查出 chunk 元数据、推导 poolId 并校验；批量更新 chunk 元数据
+//  3. 批量插入 write queue（Pending）
+//  4. 批量写入文件
+//  5. 批量插入 write queue（Success / Fail）
 //
 // poolId 从 chunk 所属 stripe 自动推导，不跨 pool。
 func (p *PoolManager) WriteChunks(items []WriteChunkItem) ([]db.Chunk, error) {
@@ -435,8 +488,9 @@ func (p *PoolManager) WriteChunks(items []WriteChunkItem) ([]db.Chunk, error) {
 
 	N := len(items)
 
-	// 预计算每个 chunk 的 hash 和 size
+	// 步骤 1: 计算 size 和 hash
 	prep := make([]ChunkData, N)
+	chunkIds := make([]int64, N)
 	for i, it := range items {
 		if len(it.Data) == 0 {
 			return nil, errs.New(errs.ECODE_CHUNK_EMPTY, errs.ESTR_CHUNK_EMPTY, "empty data", strconv.Itoa(i))
@@ -450,15 +504,12 @@ func (p *PoolManager) WriteChunks(items []WriteChunkItem) ([]db.Chunk, error) {
 				Size: int64(len(it.Data)),
 			},
 		}
+		chunkIds[i] = it.ChunkId
 	}
 
 	// ---------------------------------------------------------------
-	// 一次查出所有 chunk 及其所属 pool
+	// 步骤 2: 一次查出所有 chunk，推导 pool 并校验
 	// ---------------------------------------------------------------
-	chunkIds := make([]int64, N)
-	for i, it := range prep {
-		chunkIds[i] = it.Chunk.Id
-	}
 	var chunks []db.Chunk
 	if err := p.DbManager.DB.Where("id IN ?", chunkIds).Find(&chunks).Error; err != nil {
 		return nil, errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
@@ -469,7 +520,7 @@ func (p *PoolManager) WriteChunks(items []WriteChunkItem) ([]db.Chunk, error) {
 	}
 
 	// 推导 poolId，校验 pool 在线
-	poolId := int64(0)
+	var poolId int64
 	{
 		var stripe db.Stripe
 		if err := p.DbManager.DB.First(&stripe, chunks[0].StripeId).Error; err != nil {
@@ -487,8 +538,8 @@ func (p *PoolManager) WriteChunks(items []WriteChunkItem) ([]db.Chunk, error) {
 
 	// 校验数据大小不超过 pool 的 chunk size
 	maxSize := pool.ChunkSize * 1024
-	for _, it := range prep {
-		if int64(it.Size) > maxSize {
+	for i := range prep {
+		if prep[i].Size > maxSize {
 			return nil, errs.New(errs.ECODE_CHUNK_SIZE_EXCEED, errs.ESTR_CHUNK_SIZE_EXCEED,
 				"data exceeds pool chunk size", strconv.FormatInt(maxSize, 10))
 		}
@@ -500,8 +551,8 @@ func (p *PoolManager) WriteChunks(items []WriteChunkItem) ([]db.Chunk, error) {
 		chunkById[chunks[i].Id] = &chunks[i]
 	}
 	ordered := make([]db.Chunk, N)
-	for i, it := range prep {
-		ordered[i] = *chunkById[it.Id]
+	for i := range prep {
+		ordered[i] = *chunkById[prep[i].Id]
 	}
 
 	// 预加载盘信息（写文件用）
@@ -510,107 +561,39 @@ func (p *PoolManager) WriteChunks(items []WriteChunkItem) ([]db.Chunk, error) {
 		return nil, err
 	}
 
-	// ---------------------------------------------------------------
-	// 事务内更新 chunk 元数据（size / checksum / path / status）
-	// ---------------------------------------------------------------
-	err = p.DbManager.DB.Transaction(func(tx *gorm.DB) error {
-		for i := range ordered {
-			ordered[i].Status = db.ChunkAllocated
-			ordered[i].Size = int64(prep[i].Size)
-			ordered[i].Hash = prep[i].Hash
-		}
-		return tx.Save(&ordered).Error
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	// ---------------------------------------------------------------
-	// 事务外并发写文件
-	// ---------------------------------------------------------------
-	type writeResult struct {
-		idx int
-		err error
-	}
-	resultCh := make(chan writeResult, N)
-	var wg sync.WaitGroup
+	// 批量更新 chunk 元数据（status / size / hash），一次 upsert 完成
 	for i := range ordered {
-		wg.Add(1)
-		go func(idx int, disk db.Disk, relPath string, data []byte) {
-			defer wg.Done()
-			h := p.handlerFor(disk.Backend)
-			if h == nil {
-				resultCh <- writeResult{idx, errs.New(errs.ECODE_FILE_WRITE, errs.ESTR_FILE_WRITE,
-					"no handler for backend", strconv.Itoa(int(disk.Backend)))}
-				return
-			}
-			if err := h.Write(disk, relPath, data); err != nil {
-				resultCh <- writeResult{idx, errs.FromError(err, errs.ECODE_FILE_WRITE, errs.ESTR_FILE_WRITE)}
-			}
-		}(i, diskById[ordered[i].DiskId], ordered[i].Path, prep[i].Data)
+		ordered[i].Status = db.ChunkAllocated
+		ordered[i].Size = int64(prep[i].Size)
+		ordered[i].Hash = prep[i].Hash
 	}
-	wg.Wait()
-	close(resultCh)
-
-	// 收集失败结果
-	var firstErr error
-	var failedIdx []int
-	for r := range resultCh {
-		if r.err != nil {
-			failedIdx = append(failedIdx, r.idx)
-			if firstErr == nil {
-				firstErr = r.err
-			}
-		}
-	}
-	if firstErr != nil {
-		var errorIds, successIds []int64
-		failed := make(map[int]bool, len(failedIdx))
-		for _, idx := range failedIdx {
-			failed[idx] = true
-		}
-		for i := range ordered {
-			if failed[i] {
-				errorIds = append(errorIds, ordered[i].Id)
-			} else {
-				successIds = append(successIds, ordered[i].Id)
-			}
-		}
-		// 部分失败：失败的标 Error，成功的标 Dirty 并入队
-		if len(errorIds) > 0 {
-
-		}
-		if len(successIds) > 0 {
-			var wq []db.WriteQueue
-			for i, c := range ordered {
-				if !failed[i] {
-					wq = append(wq, db.WriteQueue{ChunkId: c.Id, StripeId: c.StripeId})
-				}
-			}
-			p.DbManager.DB.Create(&wq)
-		}
-		return nil, firstErr
-	}
-
-	// ---------------------------------------------------------------
-	// 全部写入成功：标记 Dirty 并入队 WriteQueue
-	// ---------------------------------------------------------------
-	allIds := make([]int64, N)
-	for i := range ordered {
-		allIds[i] = ordered[i].Id
-	}
-
-	writeEntries := make([]db.WriteQueue, N)
-	for i := range ordered {
-		writeEntries[i] = db.WriteQueue{
-			ChunkId:  ordered[i].Id,
-			StripeId: ordered[i].StripeId,
-		}
-	}
-	if err := p.DbManager.DB.Create(&writeEntries).Error; err != nil {
+	if err := p.DbManager.DB.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "id"}},
+		DoUpdates: clause.AssignmentColumns([]string{"status", "size", "hash"}),
+	}).Create(&ordered).Error; err != nil {
 		return nil, errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
 	}
 
+	// 步骤 3: 批量插入 write queue（Pending）
+	if err := p.enqueueWriteIntents(ordered); err != nil {
+		return nil, err
+	}
+
+	// 步骤 4: 批量写入文件
+	data := make([][]byte, N)
+	for i := range prep {
+		data[i] = prep[i].Data
+	}
+	writeErrs, firstErr := p.writeChunkFiles(ordered, data, diskById)
+
+	// 步骤 5: 批量插入 write queue（Success / Fail）
+	if err := p.enqueueWriteResults(ordered, writeErrs); err != nil {
+		return nil, err
+	}
+
+	if firstErr != nil {
+		return nil, firstErr
+	}
 	return ordered, nil
 }
 
@@ -667,50 +650,32 @@ func (p *PoolManager) ReadChunks(poolId int64, chunkIds []int64) ([][]byte, erro
 	// ---------------------------------------------------------------
 	// 并发读取（优先走缓存，未命中则从源盘读取并异步写入缓存盘）
 	// ---------------------------------------------------------------
-	type readResult struct {
-		idx       int
-		data      []byte
-		err       error
-		fromCache bool
-	}
-	resultCh := make(chan readResult, N)
-	var wg sync.WaitGroup
-	for i, c := range ordered {
-		wg.Add(1)
-		go func(idx int, chk db.Chunk) {
-			defer wg.Done()
-			// 先尝试从缓存读取（如果 pool 配置了缓存盘）
-			if data, _ := p.tryReadCache(chk.Id); data != nil {
-				resultCh <- readResult{idx: idx, data: data, err: nil, fromCache: true}
-				return
-			}
-			// 缓存未命中，从源盘读取
-			disk := diskById[chk.DiskId]
-			h := p.handlerFor(disk.Backend)
-			if h == nil {
-				resultCh <- readResult{idx, nil, errs.New(errs.ECODE_FILE_WRITE, errs.ESTR_FILE_WRITE,
-					"no handler for backend", strconv.Itoa(int(disk.Backend))), false}
-				return
-			}
-			data, err := h.Read(disk, chk.Path)
-			if err != nil {
-				resultCh <- readResult{idx, nil, errs.FromError(err, errs.ECODE_FILE_WRITE, errs.ESTR_FILE_WRITE), false}
-			} else {
-				// 异步将数据写入缓存盘
-				go p.writeCache(poolId, chk.Id, data)
-				resultCh <- readResult{idx, data, nil, false}
-			}
-		}(i, c)
-	}
-	wg.Wait()
-	close(resultCh)
-
 	results := make([][]byte, N)
-	for r := range resultCh {
-		if r.err != nil {
-			return nil, r.err
+	readErrs := parallelEach(N, 0, func(i int) error {
+		c := ordered[i]
+		// 先尝试从缓存读取（如果 pool 配置了缓存盘）
+		if cached, _ := p.tryReadCache(c.Id); cached != nil {
+			results[i] = cached
+			return nil
 		}
-		results[r.idx] = r.data
+		// 缓存未命中，从源盘读取
+		disk := diskById[c.DiskId]
+		h := p.handlerFor(disk.Backend)
+		if h == nil {
+			return errs.New(errs.ECODE_FILE_WRITE, errs.ESTR_FILE_WRITE,
+				"no handler for backend", strconv.Itoa(int(disk.Backend)))
+		}
+		data, err := h.Read(disk, c.Path)
+		if err != nil {
+			return errs.FromError(err, errs.ECODE_FILE_WRITE, errs.ESTR_FILE_WRITE)
+		}
+		// 异步将数据写入缓存盘
+		go p.writeCache(poolId, c.Id, data)
+		results[i] = data
+		return nil
+	})
+	if err := firstErr(readErrs); err != nil {
+		return nil, err
 	}
 	return results, nil
 }

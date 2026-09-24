@@ -154,6 +154,7 @@ func (p *PoolManager) AddDisk(poolId int64, path string, diskBackend int8, diskT
 				Path:     paths[i],
 				DiskId:   disk.Id,
 				StripeId: s.Id,
+				PoolId:   poolId,
 				Type:     chunkType,
 				Index:    idx,
 			}
