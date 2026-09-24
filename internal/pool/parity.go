@@ -165,35 +165,35 @@ func (p *PoolManager) computeStripe(stripeId int64, dataShards, parityShards int
 }
 
 // processStripeQueue 是 parity worker 的核心调度函数。
+// 任务来自 StripeQueue（由 Flush 从 write queue 搬运过来）。
 //
 // 整体流程：
-//  1. 清理上次意外残留的 QueueProcessing 条目
-//  2. 在一个事务中原子地领走一批 QueuePending 条目（SKIP LOCKED 避免竞争）
+//  1. 清理上次异常中断残留的 Running 条目（重置为 Pending 重新处理）
+//  2. 在一个事务中原子地领走一批 Pending 的 parity 任务（SKIP LOCKED 避免竞争）
 //  3. 按 stripe 去重，加载 stripe/pool/disk/chunk 元数据
-//  4. Phase 1: 锁定 parity chunk 并标记为 Pending（防止并发写入）
-//  5. 并发调用 computeStripe 对每个 stripe 执行 RS 编码（最多 4 路并发）
-//  6. Phase 2: 在一个事务中批量更新 data chunk→Active、parity chunk→Active、删除已处理的 WriteQueue
+//  4. 按 stripe 组织待编码的 data chunk 与 parity chunk
+//  5. 并发调用 computeStripe 对每个 stripe 执行 RS 编码（并发上限 maxParityConcurrency）
+//  6. 在一个事务中批量写回 parity chunk 的 size/hash，并删除已处理的 StripeQueue 条目
 //
 // 返回 true 表示处理了至少一个条目，false 表示空闲。
 func (p *PoolManager) processStripeQueue() bool {
 	// ---------------------------------------------------------------
 	// Step 1: 清理上次异常中断残留的 Running 条目。
 	// 如果进程在上次批次中间崩溃，这些条目会永远卡在 Running 状态。
-	// 将它们重置为 Success，让本次重新处理。
+	// 将它们重置为 Pending，让本次重新处理。
 	// ---------------------------------------------------------------
-	p.DbManager.DB.Model(&db.WriteQueue{}).
-		Where("status = ?", db.TaskRunning).Update("status", db.TaskSuccess)
+	p.DbManager.DB.Model(&db.StripeQueue{}).
+		Where("status = ?", db.TaskRunning).Update("status", db.TaskPending)
 
 	// ---------------------------------------------------------------
-	// Step 2: 在一个事务中原子地领走一批 Success 条目
-	// （Success 表示对应 chunk 数据已成功写入磁盘，可以计算 parity）。
+	// Step 2: 在一个事务中原子地领走一批 Pending 的 parity 任务。
 	// 使用 SKIP LOCKED 避免多个 parity worker（如果有）之间的锁竞争。
 	// 领走后将状态改为 TaskRunning，防止被其他 worker 重复领取。
 	// ---------------------------------------------------------------
-	var entries []db.WriteQueue
+	var entries []db.StripeQueue
 	err := p.DbManager.DB.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
-			Where("status = ?", db.TaskSuccess).
+			Where("status = ? AND type = ?", db.TaskPending, db.StripeQueueParity).
 			Find(&entries).Error; err != nil {
 			return err
 		}
@@ -204,7 +204,7 @@ func (p *PoolManager) processStripeQueue() bool {
 		for i, e := range entries {
 			ids[i] = e.Id
 		}
-		return tx.Model(&db.WriteQueue{}).
+		return tx.Model(&db.StripeQueue{}).
 			Where("id IN ?", ids).Update("status", db.TaskRunning).Error
 	})
 	if err != nil {
@@ -216,7 +216,7 @@ func (p *PoolManager) processStripeQueue() bool {
 	}
 
 	// ---------------------------------------------------------------
-	// Step 3: 从 WriteQueue 条目中提取出所有涉及的 stripe ID（去重）。
+	// Step 3: 从 StripeQueue 条目中提取出所有涉及的 stripe ID（去重）。
 	// ---------------------------------------------------------------
 	stripeSet := make(map[int64]struct{})
 	for _, e := range entries {
@@ -285,8 +285,7 @@ func (p *PoolManager) processStripeQueue() bool {
 	type stripeJob struct {
 		dataChunks    []db.Chunk
 		parityByIndex map[int64]db.Chunk
-		skip          bool // 标记该 stripe 是否应跳过
-		ds, ps        int  // data shards / parity shards 数量
+		ds, ps        int // data shards / parity shards 数量
 	}
 	jobs := make(map[int64]*stripeJob, len(stripeIds))
 
@@ -301,15 +300,11 @@ func (p *PoolManager) processStripeQueue() bool {
 		}
 		// 按 chunk 类型分别收集
 		if c.Type == db.DataChunk {
-			// data chunk 处于 Pending 或 Error 状态时，跳过整个 stripe
-			if c.Status == db.ChunkAllocated {
-				j.skip = true
+			// Reserved 是预分配但还没写入数据的 slot，不参与编码
+			if c.Status == db.ChunkReserved {
 				continue
 			}
-			// 排除预留的但未写入的 slot
-			if c.Status != db.ChunkReserved {
-				j.dataChunks = append(j.dataChunks, c)
-			}
+			j.dataChunks = append(j.dataChunks, c)
 		} else if c.Type == db.ParityChunk {
 			if j.parityByIndex == nil {
 				j.parityByIndex = make(map[int64]db.Chunk)
@@ -320,9 +315,6 @@ func (p *PoolManager) processStripeQueue() bool {
 
 	// 对每个 stripe 的 data chunks 按 Index 排序（确保 RS 编码的顺序正确）
 	for _, j := range jobs {
-		if j.skip {
-			continue
-		}
 		idxMap := make(map[int64]db.Chunk, len(j.dataChunks))
 		for _, c := range j.dataChunks {
 			idxMap[c.Index] = c
@@ -347,7 +339,7 @@ func (p *PoolManager) processStripeQueue() bool {
 	var pending []stripeJobRef
 	for _, sid := range stripeIds {
 		j, ok := jobs[sid]
-		if !ok || j.skip || len(j.dataChunks) == 0 {
+		if !ok || len(j.dataChunks) == 0 {
 			continue
 		}
 		pending = append(pending, stripeJobRef{stripeId: sid, job: j})
@@ -395,11 +387,11 @@ func (p *PoolManager) processStripeQueue() bool {
 	}
 
 	// ---------------------------------------------------------------
-	// Phase 2: 在一个事务中批量更新数据库。
+	// Step 6: 在一个事务中批量更新数据库。
 	//
 	// 更新项：
 	//   - parity chunk：更新 size / hash 并置为 Allocated
-	//   - 删除已处理的 WriteQueue 条目
+	//   - 删除已处理的 StripeQueue 条目
 	//
 	// TODO: data chunk 的 parity 就绪态（Active）尚未引入，写完即为 Allocated，
 	// 因此这里暂时没有 data chunk 的状态更新。
@@ -430,8 +422,8 @@ func (p *PoolManager) processStripeQueue() bool {
 				return fmt.Errorf("save parity: %w", err)
 			}
 		}
-		// 删除已处理完毕的 WriteQueue 条目
-		return tx.Where("status = ?", db.TaskRunning).Delete(&db.WriteQueue{}).Error
+		// 删除已处理完毕的 StripeQueue 条目
+		return tx.Where("status = ?", db.TaskRunning).Delete(&db.StripeQueue{}).Error
 	})
 	if err != nil {
 		log.Printf("parity: phase2 failed: %v", err)
