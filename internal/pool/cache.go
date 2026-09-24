@@ -207,7 +207,7 @@ func (p *PoolManager) dropCaches(chunkIds []int64) error {
 	}
 
 	if err := p.DbManager.DB.Where("chunk_id IN ?", ids).Delete(&db.ReadCache{}).Error; err != nil {
-		return errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
+		return errs.DBQuery(err)
 	}
 	p.deleteCacheFiles(files)
 	return nil
@@ -221,23 +221,14 @@ func (p *PoolManager) deleteCacheFiles(entries []db.ReadCache) {
 	}
 
 	// 一次查出涉及的缓存盘
-	diskIds := make([]int64, 0, len(entries))
-	seen := make(map[int64]struct{}, len(entries))
-	for _, e := range entries {
-		if _, ok := seen[e.DiskId]; ok {
-			continue
-		}
-		seen[e.DiskId] = struct{}{}
-		diskIds = append(diskIds, e.DiskId)
+	diskIds := make([]int64, len(entries))
+	for i, e := range entries {
+		diskIds[i] = e.DiskId
 	}
-	var disks []db.Disk
-	if err := p.DbManager.DB.Where("id IN ?", diskIds).Find(&disks).Error; err != nil {
+	diskById, err := loadDisksByIds(p.DbManager.DB, uniqueIds(diskIds))
+	if err != nil {
 		log.Printf("cache: query cache disks failed: %v", err)
 		return
-	}
-	diskById := make(map[int64]db.Disk, len(disks))
-	for i := range disks {
-		diskById[disks[i].Id] = disks[i]
 	}
 
 	deleteErrs := parallelEach(len(entries), 0, func(k int) error {

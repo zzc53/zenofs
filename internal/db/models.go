@@ -111,12 +111,14 @@ const (
 	StripeQueueRebuild
 )
 
-// WriteQueue 是 parity 计算的任务队列。
-// 当 data chunk 写入或更新时入队，parity worker 出队后计算 RS parity。
+// StripeQueue 是条带级任务队列（parity 计算 / 故障重建）。
+// TaskId 指向发起该任务的后台作业（Task）；parity 任务是写入流程的副产品，
+// 没有父作业，TaskId 为 0。
 type StripeQueue struct {
 	Id        int64           `gorm:"primaryKey"`
 	StripeId  int64           `gorm:"index"`
 	Type      StripeQueueType `gorm:"index"`
+	TaskId    int64           `gorm:"index"` // 所属重建作业（Task.Id），0 表示无父作业
 	Status    TaskStatus      `gorm:"index;default:0"`
 	CreatedAt int64           `gorm:"autoCreateTime;index"`
 }
@@ -160,8 +162,8 @@ const (
 	TaskFail                      // 3 - 失败
 )
 
-// Task 记录后台任务的执行历史。
-// 通过 acquireLock/releaseLock 机制保证同一时间只有一个 Running 任务。
+// Task 记录后台作业（一次重建 = 一条）。
+// 同一个 pool 同时只允许有一个进行中的作业：作业名带上 poolId，投递前按名字查重。
 type Task struct {
 	Id        int64          `gorm:"primaryKey"`
 	Name      string         `gorm:"index"`
@@ -220,14 +222,16 @@ type User struct {
 }
 
 // Share 是用户可见的存储空间，绑定一个存储池。
-// 支持按需配置压缩和加密。
+// 支持按需配置压缩、加密和空间配额。
 type Share struct {
 	Id                int64  `gorm:"primaryKey"`
 	Name              string `gorm:"uniqueIndex;not null"`
 	PoolId            int64  `gorm:"index;not null"` // 绑定到哪个存储池
-	Compression       int8   `gorm:"default:0"`      // 压缩算法（0=无）
-	Encryption        int8   `gorm:"default:0"`      // 加密算法（0=无）
-	EncryptionKeyHash []byte `gorm:"default:null"`   // 加密密钥哈希（启用加密时非空）
+	Quota             int64  `gorm:"default:0"`      // 空间配额上限（MB），0 表示不限制
+	SliceSize         int64  `gorm:"default:4096"`   // 文件切片大小（KB），决定 version chunk 的定长边界
+	Compression       int8   `gorm:"default:0"`      // 压缩算法（取值见 vfs.Compression*：0=无、1=zstd）
+	Encryption        int8   `gorm:"default:0"`      // 加密算法（取值见 vfs.Encryption*：0=无、1=AES-256-GCM）
+	EncryptionKeyHash []byte `gorm:"default:null"`   // 加密密钥校验值 / PBKDF2 salt（启用加密时非空）
 	CreatedBy         int64  `gorm:"index"`          // 创建者用户 ID
 	CreatedAt         int64  `gorm:"autoCreateTime"`
 }
@@ -243,26 +247,35 @@ type ShareUser struct {
 // parent_id 为 NULL 时表示 Share 根目录。
 // kind=link 时 LinkId 指向目标 inode。
 // 软删除通过 Deleted 标志实现，保留历史记录。
+//
+// 对外（internal/vfs）的属性映射：
+//
+//	uid   → CreatedBy（属主用户）
+//	gid   → ShareId（所属 Share）
+//	atime / ctime / mtime → UpdatedAt
+//	mode  → 只区分"是否可执行"（Executable 字段）；读写权限由
+//	        ShareUser.Permission 在挂载层控制，不落在 inode 上
 type Inode struct {
-	Id        int64         `gorm:"primaryKey;autoIncrement"`
-	ParentId  sql.NullInt64 `gorm:"index:idx_inode_parent_name,priority:1"`
-	Name      string        `gorm:"index:idx_inode_parent_name,priority:2"`
-	Kind      InodeKind     `gorm:"default:0"`
-	ShareId   int64         `gorm:"index"`
-	VersionId sql.NullInt64 `gorm:"index"` // 当前文件版本（目录/链接为 NULL）
-	LinkId    sql.NullInt64 `gorm:"index"` // 链接目标 inode（仅 kind=link）
-	CreatedBy int64         `gorm:"index"` // 创建用户ID
-	CreatedAt int64         `gorm:"autoCreateTime"`
-	UpdatedBy int64         `gorm:"index"`
-	UpdatedAt int64         `gorm:"autoUpdateTime"`
-	Deleted   int8          `gorm:"default:0;index"` // 软删除标记
+	Id         int64         `gorm:"primaryKey;autoIncrement"`
+	ParentId   sql.NullInt64 `gorm:"index:idx_inode_parent_name,priority:1"`
+	Name       string        `gorm:"index:idx_inode_parent_name,priority:2"`
+	Kind       InodeKind     `gorm:"default:0"`
+	ShareId    int64         `gorm:"index"`
+	VersionId  sql.NullInt64 `gorm:"index"`     // 当前文件版本（目录/链接为 NULL）
+	LinkId     sql.NullInt64 `gorm:"index"`     // 链接目标 inode（仅 kind=link）
+	Executable int8          `gorm:"default:0"` // 1 表示可执行（POSIX 的 x 位）
+	CreatedBy  int64         `gorm:"index"`     // 创建用户ID
+	CreatedAt  int64         `gorm:"autoCreateTime"`
+	UpdatedBy  int64         `gorm:"index"`
+	UpdatedAt  int64         `gorm:"autoUpdateTime"`
+	Deleted    int8          `gorm:"default:0;index"` // 软删除标记
 }
 
 // Version 是文件的一个快照版本。
 // 同一文件的版本号递增，支持回滚和版本管理。
 type Version struct {
 	Id          int64         `gorm:"primaryKey;autoIncrement"`
-	InodeId     int64         `gorm:"uniqueIndex:idx_ver_inode_num,priority:1;not null"`
+	InodeId     int64         `gorm:"index;not null"` // 同一 inode 可有多个版本，当前版本由 Inode.VersionId 指定
 	ParentId    sql.NullInt64 `gorm:"index"`
 	Size        int64         `gorm:"default:0"` // 文件总大小
 	Hash        string        // 文件级哈希（所有 chunk 拼接后）

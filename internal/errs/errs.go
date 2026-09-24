@@ -4,21 +4,19 @@
 // 字符串码和可读消息，便于客户端解析和定位。
 package errs
 
-import "fmt"
-
 // ── 错误码（数值） ──
 
 const (
-	ECODE_DB_BAD_DSN   = 1  // 数据库连接串格式不支持
-	ECODE_DB_BAD_CONN  = 2  // 数据库连接失败
-	ECODE_DB_BAD_QUERY = 3  // 数据库查询执行错误
+	ECODE_DB_BAD_DSN   = 1 // 数据库连接串格式不支持
+	ECODE_DB_BAD_CONN  = 2 // 数据库连接失败
+	ECODE_DB_BAD_QUERY = 3 // 数据库查询执行错误
 
-	ECODE_POOL_BAD_NAME    = 4  // Pool 名称重复
-	ECODE_POOL_BAD         = 5  // Pool 操作参数错误
-	ECODE_DISK_BAD_BACKEND = 6  // 不支持的磁盘后端类型
-	ECODE_DISK_BAD_TYPE    = 7  // 不支持的磁盘角色类型
-	ECODE_DISK_OFFLINE     = 8  // 磁盘不在线
-	ECODE_POOL_OFFLINE     = 9  // Pool 不在线
+	ECODE_POOL_BAD_NAME    = 4 // Pool 名称重复
+	ECODE_POOL_BAD         = 5 // Pool 操作参数错误
+	ECODE_DISK_BAD_BACKEND = 6 // 不支持的磁盘后端类型
+	ECODE_DISK_BAD_TYPE    = 7 // 不支持的磁盘角色类型
+	ECODE_DISK_OFFLINE     = 8 // 磁盘不在线
+	ECODE_POOL_OFFLINE     = 9 // Pool 不在线
 
 	ECODE_CRYPTO_ERROR = 10 // 随机数生成或加密失败
 	ECODE_FILE_WRITE   = 11 // 文件读写错误
@@ -45,7 +43,7 @@ const (
 	ESTR_CRYPTO_ERROR = "CRYPTO_ERROR"
 	ESTR_FILE_WRITE   = "FILE_WRITE"
 
-	ESTR_CHUNK_EMPTY       = "CHUNK_ALLOC"
+	ESTR_CHUNK_EMPTY       = "CHUNK_EMPTY"
 	ESTR_CHUNK_SIZE_EXCEED = "CHUNK_SIZE_EXCEED"
 	ESTR_CHUNK_NOT_FOUND   = "CHUNK_NOT_FOUND"
 )
@@ -71,13 +69,19 @@ func New(code int, strCode string, msg string, val string) *ZenoError {
 	return &ZenoError{Code: code, StrCode: strCode, Message: msg, Value: val}
 }
 
+// DBQuery 把数据库查询/写入错误包装成统一的 ZenoError（ECODE_DB_BAD_QUERY）。
+func DBQuery(err error) *ZenoError {
+	return FromError(err, ECODE_DB_BAD_QUERY, ESTR_DB_BAD_QUERY)
+}
+
 // Error 实现 error 接口。
+// 优先暴露内部原始错误；否则拼上上下文值，便于定位。
 func (e *ZenoError) Error() string {
 	if e.InnerErr != nil {
-		return fmt.Sprintf("%s", e.InnerErr)
+		return e.InnerErr.Error()
 	}
 	if e.Value != "" {
-		return fmt.Sprintf("%s: %s", e.Message, e.Value)
+		return e.Message + ": " + e.Value
 	}
 	return e.Message
 }

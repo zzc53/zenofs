@@ -7,8 +7,9 @@ import (
 	"time"
 
 	"github.com/klauspost/reedsolomon"
-	"github.com/zeebo/blake3"
 	"github.com/zzc53/zenofs/internal/db"
+	"github.com/zzc53/zenofs/internal/errs"
+	"github.com/zzc53/zenofs/internal/hash"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -48,13 +49,13 @@ func (p *PoolManager) computeStripe(stripeId int64, dataShards, parityShards int
 	dataChunks []db.Chunk, parityByIndex map[int64]db.Chunk, diskById map[int64]db.Disk) ([]stripeResult, bool) {
 
 	// ---------------------------------------------------------------
-	// 第一步：分配 shard 数组。shards[0..dataShards-1] 放 data，
+	// 1. 分配 shard 数组。shards[0..dataShards-1] 放 data，
 	// shards[dataShards..] 放 parity。
 	// ---------------------------------------------------------------
 	shards := make([][]byte, dataShards+parityShards)
 
 	// ---------------------------------------------------------------
-	// 第二步：并发读取所有 data chunk 的数据，按 index 填入 shards 数组。
+	// 2. 并发读取所有 data chunk 的数据，按 index 填入 shards 数组。
 	// ---------------------------------------------------------------
 	readErrs := parallelEach(len(dataChunks), 0, func(i int) error {
 		c := dataChunks[i]
@@ -82,7 +83,7 @@ func (p *PoolManager) computeStripe(stripeId int64, dataShards, parityShards int
 	}
 
 	// ---------------------------------------------------------------
-	// 第三步：将所有 data shard padding 到等长。
+	// 3. 将所有 data shard padding 到等长。
 	// RS 编码要求输入的所有 shard 长度一致。找出最长的一个，
 	// 将其余不足的 shard 用 0 padding 补足。
 	// ---------------------------------------------------------------
@@ -112,7 +113,7 @@ func (p *PoolManager) computeStripe(stripeId int64, dataShards, parityShards int
 	}
 
 	// ---------------------------------------------------------------
-	// 第四步：初始化 Reed-Solomon 编码器，执行编码。
+	// 4. 初始化 Reed-Solomon 编码器，执行编码。
 	// 编码完成后 shards[dataShards..] 中存放的是计算出的 parity 数据。
 	// ---------------------------------------------------------------
 	enc, err := reedsolomon.New(dataShards, parityShards)
@@ -126,7 +127,7 @@ func (p *PoolManager) computeStripe(stripeId int64, dataShards, parityShards int
 	}
 
 	// ---------------------------------------------------------------
-	// 第五步：并发将 parity shard 写入磁盘，并计算各 shard 的 BLAKE3 哈希。
+	// 5. 并发将 parity shard 写入磁盘，并计算各 shard 的 BLAKE3 哈希。
 	// ---------------------------------------------------------------
 	results := make([]stripeResult, parityShards)
 	writeErrs := parallelEach(parityShards, 0, func(idx int) error {
@@ -153,7 +154,7 @@ func (p *PoolManager) computeStripe(stripeId int64, dataShards, parityShards int
 		results[idx] = stripeResult{
 			parityIdx:  int64(idx),
 			parityData: parityData,
-			parityHash: blake3.Sum256(parityData),
+			parityHash: hash.SumArray(parityData),
 		}
 		return nil
 	})
@@ -164,178 +165,36 @@ func (p *PoolManager) computeStripe(stripeId int64, dataShards, parityShards int
 	return results, true
 }
 
-// processStripeQueue 是 parity worker 的核心调度函数。
-// 任务来自 StripeQueue（由 Flush 从 write queue 搬运过来）。
+// calculateStripeParity 是 parity worker 的核心调度函数。
+// 任务来自 StripeQueue 中 type = StripeQueueParity 的条目（由 Flush 从 write queue 搬运而来）。
 //
 // 整体流程：
-//  1. 清理上次异常中断残留的 Running 条目（重置为 Pending 重新处理）
-//  2. 在一个事务中原子地领走一批 Pending 的 parity 任务（SKIP LOCKED 避免竞争）
-//  3. 按 stripe 去重，加载 stripe/pool/disk/chunk 元数据
-//  4. 按 stripe 组织待编码的 data chunk 与 parity chunk
-//  5. 并发调用 computeStripe 对每个 stripe 执行 RS 编码（并发上限 maxParityConcurrency）
-//  6. 在一个事务中批量写回 parity chunk 的 size/hash，并删除已处理的 StripeQueue 条目
+//  1. 领取一批任务（清理残留 Running、SKIP LOCKED 领走 Pending，见 claimStripeTasks）
+//  2. 加载 stripe/pool/disk/chunk 元数据（见 loadStripeMeta）
+//  3. 按 stripe 组织待编码的 data chunk 与 parity chunk（见 buildStripeJobs）
+//  4. 并发调用 computeStripe 对每个 stripe 执行 RS 编码（并发上限 maxParityConcurrency）
+//  5. 在一个事务中批量写回 parity chunk 的 size/hash，并删除已处理的 StripeQueue 条目
 //
 // 返回 true 表示处理了至少一个条目，false 表示空闲。
-func (p *PoolManager) processStripeQueue() bool {
-	// ---------------------------------------------------------------
-	// Step 1: 清理上次异常中断残留的 Running 条目。
-	// 如果进程在上次批次中间崩溃，这些条目会永远卡在 Running 状态。
-	// 将它们重置为 Pending，让本次重新处理。
-	// ---------------------------------------------------------------
-	p.DbManager.DB.Model(&db.StripeQueue{}).
-		Where("status = ?", db.TaskRunning).Update("status", db.TaskPending)
-
-	// ---------------------------------------------------------------
-	// Step 2: 在一个事务中原子地领走一批 Pending 的 parity 任务。
-	// 使用 SKIP LOCKED 避免多个 parity worker（如果有）之间的锁竞争。
-	// 领走后将状态改为 TaskRunning，防止被其他 worker 重复领取。
-	// ---------------------------------------------------------------
-	var entries []db.StripeQueue
-	err := p.DbManager.DB.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
-			Where("status = ? AND type = ?", db.TaskPending, db.StripeQueueParity).
-			Find(&entries).Error; err != nil {
-			return err
-		}
-		if len(entries) == 0 {
-			return nil
-		}
-		ids := make([]int64, len(entries))
-		for i, e := range entries {
-			ids[i] = e.Id
-		}
-		return tx.Model(&db.StripeQueue{}).
-			Where("id IN ?", ids).Update("status", db.TaskRunning).Error
-	})
-	if err != nil {
-		log.Printf("parity: claim pending entries failed: %v", err)
-		return false
-	}
+func (p *PoolManager) calculateStripeParity() bool {
+	entries := p.claimStripeTasks(db.StripeQueueParity)
 	if len(entries) == 0 {
 		return false
 	}
 
-	// ---------------------------------------------------------------
-	// Step 3: 从 StripeQueue 条目中提取出所有涉及的 stripe ID（去重）。
-	// ---------------------------------------------------------------
-	stripeSet := make(map[int64]struct{})
-	for _, e := range entries {
-		stripeSet[e.StripeId] = struct{}{}
-	}
-	stripeIds := make([]int64, 0, len(stripeSet))
-	for id := range stripeSet {
-		stripeIds = append(stripeIds, id)
-	}
-
-	// ---------------------------------------------------------------
-	// Step 4: 加载 stripe → pool → disk 的完整元数据链。
-	//
-	// 4a. 加载 stripe 列表，建立 stripeId → poolId 映射
-	// ---------------------------------------------------------------
-	var stripes []db.Stripe
-	if err := p.DbManager.DB.Where("id IN ?", stripeIds).Find(&stripes).Error; err != nil {
-		log.Printf("parity: query stripes failed: %v", err)
-		return false
-	}
-	poolMap := make(map[int64]int64)
-	poolSet := make(map[int64]struct{})
-	for _, s := range stripes {
-		poolMap[s.Id] = s.PoolId
-		poolSet[s.PoolId] = struct{}{}
-	}
-	poolIds := make([]int64, 0, len(poolSet))
-	for id := range poolSet {
-		poolIds = append(poolIds, id)
-	}
-
-	// 4b. 加载 pool 配置（DataShards / ParityShards）
-	var pools []db.Pool
-	if err := p.DbManager.DB.Where("id IN ?", poolIds).Find(&pools).Error; err != nil {
-		log.Printf("parity: query pools failed: %v", err)
-		return false
-	}
-	poolConfig := make(map[int64]struct{ DataShards, ParityShards int64 })
-	for _, pl := range pools {
-		poolConfig[pl.Id] = struct{ DataShards, ParityShards int64 }{pl.DataShards, pl.ParityShards}
-	}
-
-	// 4c. 加载所有涉及的磁盘信息，建立 diskId → Disk 映射
-	var disks []db.Disk
-	if err := p.DbManager.DB.Where("pool_id IN ?", poolIds).Find(&disks).Error; err != nil {
-		log.Printf("parity: query disks failed: %v", err)
-		return false
-	}
-	diskById := make(map[int64]db.Disk, len(disks))
-	for i := range disks {
-		diskById[disks[i].Id] = disks[i]
-	}
-
-	// 4d. 一次性加载所有 stripe 的全部 chunk 元数据
-	var allChunks []db.Chunk
-	if err := p.DbManager.DB.Where("stripe_id IN ?", stripeIds).Find(&allChunks).Error; err != nil {
-		log.Printf("parity: query chunks failed: %v", err)
+	stripeIds := stripeIdsOf(entries)
+	meta, err := p.loadStripeMeta(stripeIds)
+	if err != nil {
+		log.Printf("parity: load metadata failed: %v", err)
 		return false
 	}
 
-	// ---------------------------------------------------------------
-	// Step 5: 按 stripe 组织 chunk 数据。
-	// 每个 stripeJob 包含 dataChunks(待编码的 data chunk) 和
-	// parityByIndex(parity chunk 按 index 索引)。
-	// ---------------------------------------------------------------
-	type stripeJob struct {
-		dataChunks    []db.Chunk
-		parityByIndex map[int64]db.Chunk
-		ds, ps        int // data shards / parity shards 数量
-	}
-	jobs := make(map[int64]*stripeJob, len(stripeIds))
-
-	for _, c := range allChunks {
-		j, ok := jobs[c.StripeId]
-		if !ok {
-			// 首次遇到该 stripe，创建 job 并从 poolConfig 读取 RS 参数
-			pid := poolMap[c.StripeId]
-			cfg := poolConfig[pid]
-			j = &stripeJob{ds: int(cfg.DataShards), ps: int(cfg.ParityShards)}
-			jobs[c.StripeId] = j
-		}
-		// 按 chunk 类型分别收集
-		if c.Type == db.DataChunk {
-			// Reserved 是预分配但还没写入数据的 slot，不参与编码
-			if c.Status == db.ChunkReserved {
-				continue
-			}
-			j.dataChunks = append(j.dataChunks, c)
-		} else if c.Type == db.ParityChunk {
-			if j.parityByIndex == nil {
-				j.parityByIndex = make(map[int64]db.Chunk)
-			}
-			j.parityByIndex[c.Index] = c
-		}
-	}
-
-	// 对每个 stripe 的 data chunks 按 Index 排序（确保 RS 编码的顺序正确）
-	for _, j := range jobs {
-		idxMap := make(map[int64]db.Chunk, len(j.dataChunks))
-		for _, c := range j.dataChunks {
-			idxMap[c.Index] = c
-		}
-		ordered := make([]db.Chunk, 0, j.ds)
-		for i := int64(0); i < int64(j.ds); i++ {
-			if c, ok := idxMap[i]; ok {
-				ordered = append(ordered, c)
-			}
-		}
-		j.dataChunks = ordered
-	}
+	jobs := buildStripeJobs(stripeIds, meta)
 
 	// ---------------------------------------------------------------
 	// 并发计算 RS parity：对每个待处理的 stripe 并发调用 computeStripe，
 	// 并发上限为 maxParityConcurrency，防止内存被大量 stripe 撑爆。
 	// ---------------------------------------------------------------
-	type stripeJobRef struct {
-		stripeId int64
-		job      *stripeJob
-	}
 	var pending []stripeJobRef
 	for _, sid := range stripeIds {
 		j, ok := jobs[sid]
@@ -352,7 +211,7 @@ func (p *PoolManager) processStripeQueue() bool {
 	parallelEach(len(pending), maxParityConcurrency, func(i int) error {
 		ref := pending[i]
 		res, ok := p.computeStripe(ref.stripeId, ref.job.ds, ref.job.ps,
-			ref.job.dataChunks, ref.job.parityByIndex, diskById)
+			ref.job.dataChunks, ref.job.parityByIndex, meta.diskById)
 		stripeOK[i], stripeResults[i] = ok, res
 		return nil
 	})
@@ -387,7 +246,7 @@ func (p *PoolManager) processStripeQueue() bool {
 	}
 
 	// ---------------------------------------------------------------
-	// Step 6: 在一个事务中批量更新数据库。
+	// 5. 在一个事务中批量更新数据库。
 	//
 	// 更新项：
 	//   - parity chunk：更新 size / hash 并置为 Allocated
@@ -426,7 +285,7 @@ func (p *PoolManager) processStripeQueue() bool {
 		return tx.Where("status = ?", db.TaskRunning).Delete(&db.StripeQueue{}).Error
 	})
 	if err != nil {
-		log.Printf("parity: phase2 failed: %v", err)
+		log.Printf("parity: update metadata failed: %v", err)
 		return false
 	}
 
@@ -435,7 +294,8 @@ func (p *PoolManager) processStripeQueue() bool {
 	return true
 }
 
-// StartParityWorker 启动后台 goroutine，按上下文退避轮询 DB 处理 parity。
+// StartParityWorker 启动后台 goroutine，按上下文退避轮询 DB，
+// 依次驱动条带重建（rebuildStripe）与 parity 计算（calculateStripeParity）。
 //
 // 轮询策略：
 //   - 初始间隔 1 秒
@@ -454,8 +314,11 @@ func (p *PoolManager) StartParityWorker(ctx context.Context) {
 				// 收到退出信号，goroutine 立即返回
 				return
 			case <-ticker.C:
-				// 执行一次 parity 处理
-				hadWork := p.processStripeQueue()
+				// 每轮两个队列各推进一次：重建优先于 parity 计算
+				hadWork := p.rebuildStripe()
+				if p.calculateStripeParity() {
+					hadWork = true
+				}
 				if hadWork {
 					// 有任务处理，恢复为 1 秒间隔
 					interval = 1 * time.Second
@@ -471,4 +334,168 @@ func (p *PoolManager) StartParityWorker(ctx context.Context) {
 		}
 	}()
 	log.Printf("parity worker started (interval=1s, max_backoff=5s)")
+}
+
+// ---------------------------------------------------------------
+// 条带任务队列的公共部分
+// ---------------------------------------------------------------
+
+// stripeJob 是单个 stripe 的处理单元。
+// dataChunks 是参与编码/重建的 data chunk（按 index 升序），
+// parityByIndex 是 parity chunk 按 index 的索引；两者合起来即该条带的全部分片。
+type stripeJob struct {
+	dataChunks    []db.Chunk
+	parityByIndex map[int64]db.Chunk
+	ds, ps        int // data shards / parity shards 数量
+}
+
+// stripeJobRef 把一个 stripe ID 与它的处理单元绑在一起。
+type stripeJobRef struct {
+	stripeId int64
+	job      *stripeJob
+}
+
+// stripeMeta 是处理一批 stripe 任务所需的元数据快照。
+type stripeMeta struct {
+	poolMap    map[int64]int64 // stripeId → poolId
+	poolConfig map[int64]struct{ DataShards, ParityShards int64 }
+	diskById   map[int64]db.Disk
+	chunks     []db.Chunk // 这批 stripe 的全部 chunk
+}
+
+// claimStripeTasks 清理该类型残留的 Running 条目，并在一个事务中原子地领走一批 Pending 任务。
+//
+// 进程在上次批次中间崩溃时 Running 条目会永远卡住，这里按类型重置为 Pending 重新处理；
+// 领取用 SKIP LOCKED 避免多个 worker 之间的锁竞争，领到后置为 TaskRunning。
+// 队列为空时返回 nil。
+func (p *PoolManager) claimStripeTasks(queueType db.StripeQueueType) []db.StripeQueue {
+	p.DbManager.DB.Model(&db.StripeQueue{}).
+		Where("status = ? AND type = ?", db.TaskRunning, queueType).
+		Update("status", db.TaskPending)
+
+	var entries []db.StripeQueue
+	err := p.DbManager.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
+			Where("status = ? AND type = ?", db.TaskPending, queueType).
+			Find(&entries).Error; err != nil {
+			return err
+		}
+		if len(entries) == 0 {
+			return nil
+		}
+		ids := make([]int64, len(entries))
+		for i, e := range entries {
+			ids[i] = e.Id
+		}
+		return tx.Model(&db.StripeQueue{}).
+			Where("id IN ?", ids).Update("status", db.TaskRunning).Error
+	})
+	if err != nil {
+		log.Printf("stripe queue: claim tasks failed: %v", err)
+		return nil
+	}
+	return entries
+}
+
+// stripeIdsOf 提取这批任务涉及的 stripe ID（去重）。
+func stripeIdsOf(entries []db.StripeQueue) []int64 {
+	set := make(map[int64]struct{}, len(entries))
+	for _, e := range entries {
+		set[e.StripeId] = struct{}{}
+	}
+	ids := make([]int64, 0, len(set))
+	for id := range set {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// loadStripeMeta 加载 stripe → pool → disk → chunk 的完整元数据链。
+func (p *PoolManager) loadStripeMeta(stripeIds []int64) (*stripeMeta, error) {
+	var stripes []db.Stripe
+	if err := p.DbManager.DB.Where("id IN ?", stripeIds).Find(&stripes).Error; err != nil {
+		return nil, errs.DBQuery(err)
+	}
+	poolMap := make(map[int64]int64, len(stripes))
+	poolSet := make(map[int64]struct{})
+	for _, s := range stripes {
+		poolMap[s.Id] = s.PoolId
+		poolSet[s.PoolId] = struct{}{}
+	}
+	poolIds := make([]int64, 0, len(poolSet))
+	for id := range poolSet {
+		poolIds = append(poolIds, id)
+	}
+
+	var pools []db.Pool
+	if err := p.DbManager.DB.Where("id IN ?", poolIds).Find(&pools).Error; err != nil {
+		return nil, errs.DBQuery(err)
+	}
+	poolConfig := make(map[int64]struct{ DataShards, ParityShards int64 }, len(pools))
+	for _, pl := range pools {
+		poolConfig[pl.Id] = struct{ DataShards, ParityShards int64 }{pl.DataShards, pl.ParityShards}
+	}
+
+	var disks []db.Disk
+	if err := p.DbManager.DB.Where("pool_id IN ?", poolIds).Find(&disks).Error; err != nil {
+		return nil, errs.DBQuery(err)
+	}
+	diskById := make(map[int64]db.Disk, len(disks))
+	for i := range disks {
+		diskById[disks[i].Id] = disks[i]
+	}
+
+	var allChunks []db.Chunk
+	if err := p.DbManager.DB.Where("stripe_id IN ?", stripeIds).Find(&allChunks).Error; err != nil {
+		return nil, errs.DBQuery(err)
+	}
+
+	return &stripeMeta{
+		poolMap:    poolMap,
+		poolConfig: poolConfig,
+		diskById:   diskById,
+		chunks:     allChunks,
+	}, nil
+}
+
+// buildStripeJobs 把 chunk 元数据按 stripe 组织成处理单元。
+// dataChunks 只收已写入的 data chunk（Reserved 是预分配但没写数据的 slot），并按 index 升序排列。
+func buildStripeJobs(stripeIds []int64, meta *stripeMeta) map[int64]*stripeJob {
+	jobs := make(map[int64]*stripeJob, len(stripeIds))
+	for _, c := range meta.chunks {
+		j, ok := jobs[c.StripeId]
+		if !ok {
+			cfg := meta.poolConfig[meta.poolMap[c.StripeId]]
+			j = &stripeJob{ds: int(cfg.DataShards), ps: int(cfg.ParityShards)}
+			jobs[c.StripeId] = j
+		}
+		switch c.Type {
+		case db.DataChunk:
+			if c.Status == db.ChunkReserved {
+				continue // 预分配但还没写入数据的 slot，不参与编码
+			}
+			j.dataChunks = append(j.dataChunks, c)
+		case db.ParityChunk:
+			if j.parityByIndex == nil {
+				j.parityByIndex = make(map[int64]db.Chunk)
+			}
+			j.parityByIndex[c.Index] = c
+		}
+	}
+
+	// 对每个 stripe 的 data chunks 按 Index 排序（确保 RS 编码的顺序正确）
+	for _, j := range jobs {
+		idxMap := make(map[int64]db.Chunk, len(j.dataChunks))
+		for _, c := range j.dataChunks {
+			idxMap[c.Index] = c
+		}
+		ordered := make([]db.Chunk, 0, j.ds)
+		for i := int64(0); i < int64(j.ds); i++ {
+			if c, ok := idxMap[i]; ok {
+				ordered = append(ordered, c)
+			}
+		}
+		j.dataChunks = ordered
+	}
+	return jobs
 }

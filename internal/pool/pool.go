@@ -44,6 +44,24 @@ func (p *PoolManager) GetPool(id int64) (*db.Pool, error) {
 	return &existingPool, nil
 }
 
+// PoolIdOfChunk 由 chunk 所属的 stripe 推导它所在的 pool。
+func (p *PoolManager) PoolIdOfChunk(chunkId int64) (int64, error) {
+	var chunk db.Chunk
+	if err := p.DbManager.DB.First(&chunk, chunkId).Error; err != nil {
+		return 0, errs.FromError(err, errs.ECODE_CHUNK_NOT_FOUND, errs.ESTR_CHUNK_NOT_FOUND)
+	}
+	return p.poolIdByStripeId(chunk.StripeId)
+}
+
+// poolIdByStripeId 由 stripe ID 推导所属 pool。
+func (p *PoolManager) poolIdByStripeId(stripeId int64) (int64, error) {
+	var stripe db.Stripe
+	if err := p.DbManager.DB.First(&stripe, stripeId).Error; err != nil {
+		return 0, errs.DBQuery(err)
+	}
+	return stripe.PoolId, nil
+}
+
 // AddPool 创建一个新的存储池。
 // chunkSizeKb 范围 1~65536 KB（最大 64MB）。
 func (p *PoolManager) AddPool(name string, chunkSizeKb int64) (*db.Pool, error) {
@@ -62,7 +80,7 @@ func (p *PoolManager) AddPool(name string, chunkSizeKb int64) (*db.Pool, error) 
 
 	result := p.DbManager.DB.Create(&pool)
 	if result.Error != nil {
-		return nil, errs.FromError(result.Error, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
+		return nil, errs.DBQuery(result.Error)
 	}
 	return &pool, nil
 }
@@ -92,7 +110,7 @@ func (p *PoolManager) AddDisk(poolId int64, path string, diskBackend int8, diskT
 			Status:  db.DiskPoolStatus(db.Online),
 		}
 		if err := p.DbManager.DB.Create(&disk).Error; err != nil {
-			return nil, errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
+			return nil, errs.DBQuery(err)
 		}
 		return &disk, nil
 	}
@@ -103,7 +121,7 @@ func (p *PoolManager) AddDisk(poolId int64, path string, diskBackend int8, diskT
 	err := p.DbManager.DB.Transaction(func(tx *gorm.DB) error {
 		var existingPool db.Pool
 		if err1 := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).Where("id = ?", poolId).First(&existingPool).Error; err1 != nil {
-			return errs.FromError(err1, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
+			return errs.DBQuery(err1)
 
 		}
 		if existingPool.Id == 0 {
@@ -117,7 +135,7 @@ func (p *PoolManager) AddDisk(poolId int64, path string, diskBackend int8, diskT
 			Status:  db.DiskPoolStatus(db.Online),
 		}
 		if err1 := tx.Create(&disk).Error; err1 != nil {
-			return errs.FromError(err1, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
+			return errs.DBQuery(err1)
 		}
 		if addParity {
 			existingPool.ParityShards += 1
@@ -129,7 +147,7 @@ func (p *PoolManager) AddDisk(poolId int64, path string, diskBackend int8, diskT
 			idx = existingPool.DataShards - 1
 		}
 		if err1 := tx.Save(&existingPool).Error; err1 != nil {
-			return errs.FromError(err1, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
+			return errs.DBQuery(err1)
 		}
 		return nil
 	})
@@ -140,7 +158,7 @@ func (p *PoolManager) AddDisk(poolId int64, path string, diskBackend int8, diskT
 	// 释放 pool 锁后，为已有 stripe 预分配 chunk slot（新盘对应位置）
 	var stripes []db.Stripe
 	if err := p.DbManager.DB.Where("pool_id = ?", poolId).Find(&stripes).Error; err != nil {
-		return nil, errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
+		return nil, errs.DBQuery(err)
 	}
 	if len(stripes) > 0 {
 		allocs := make([]db.Chunk, len(stripes))
@@ -160,7 +178,7 @@ func (p *PoolManager) AddDisk(poolId int64, path string, diskBackend int8, diskT
 			}
 		}
 		if err := p.DbManager.DB.Create(&allocs).Error; err != nil {
-			return nil, errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
+			return nil, errs.DBQuery(err)
 		}
 	}
 	return &disk, nil
@@ -172,29 +190,64 @@ func (p *PoolManager) OfflinePool(poolId int64) error {
 		Where("id = ?", poolId).Update("status", db.Offline).Error
 }
 
-// SwapDisk 替换硬盘路径：标记 disk 为 Repair，对应 chunk 标记 Error，更新路径。
+// SwapDisk 替换硬盘路径：标记 disk 为 Repair、更新路径，
+// 并把所属 pool 置为 Offline——换盘后条带数据不完整，池在重建完成前不应对外服务。
+// 重建完成后由 recoverAfterRebuild 自动恢复 Online。
 func (p *PoolManager) SwapDisk(diskId int64, newPath string) error {
 	return p.DbManager.DB.Transaction(func(tx *gorm.DB) error {
+		var disk db.Disk
+		if err := tx.First(&disk, diskId).Error; err != nil {
+			return errs.DBQuery(err)
+		}
 		if err := tx.Model(&db.Disk{}).Where("id = ?", diskId).
 			Updates(map[string]interface{}{
 				"status": db.Repair,
 				"path":   newPath,
 			}).Error; err != nil {
-			return err
+			return errs.DBQuery(err)
 		}
-		return nil
+		return tx.Model(&db.Pool{}).Where("id = ?", disk.PoolId).
+			Update("status", db.Offline).Error
 	})
 }
 
+// getDiskMapByPoolId 查出该池的全部磁盘，按磁盘 id 建索引（写文件时按 chunk 找盘用）。
 func (p *PoolManager) getDiskMapByPoolId(poolId int64) (map[int64]db.Disk, error) {
 	// 预加载盘信息（写文件用）
 	var allDisks []db.Disk
 	if err := p.DbManager.DB.Where("pool_id = ?", poolId).Find(&allDisks).Error; err != nil {
-		return nil, errs.FromError(err, errs.ECODE_DB_BAD_QUERY, errs.ESTR_DB_BAD_QUERY)
+		return nil, errs.DBQuery(err)
 	}
 	diskById := make(map[int64]db.Disk, len(allDisks))
 	for i := range allDisks {
 		diskById[allDisks[i].Id] = allDisks[i]
 	}
 	return diskById, nil
+}
+
+// loadDisksByIds 用给定的连接/事务一次查出这批磁盘，按磁盘 id 建索引。
+func loadDisksByIds(gdb *gorm.DB, ids []int64) (map[int64]db.Disk, error) {
+	var disks []db.Disk
+	if err := gdb.Where("id IN ?", ids).Find(&disks).Error; err != nil {
+		return nil, errs.DBQuery(err)
+	}
+	diskById := make(map[int64]db.Disk, len(disks))
+	for i := range disks {
+		diskById[disks[i].Id] = disks[i]
+	}
+	return diskById, nil
+}
+
+// uniqueIds 去掉重复的 id，保持首次出现的顺序。
+func uniqueIds(ids []int64) []int64 {
+	seen := make(map[int64]struct{}, len(ids))
+	out := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
 }
