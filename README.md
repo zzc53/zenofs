@@ -85,6 +85,10 @@ internal/errs/     统一错误码与 ZenoError
 internal/hash/     摘要算法收口（BLAKE3-256；分片/校验分片/口令校验值都用它）
 internal/pool/     核心：存储池 / 磁盘 / chunk / parity / 读缓存
 internal/testutil/ 测试脚手架：临时 SQLite 库 + 本地盘存储池 + Share 行（只被 _test.go 引用）
+internal/token/    访问凭证（access token）：生成 / 单向摘要 / 过期校验，SMB / SFTP / WebDAV 共用
+internal/smb/      SMB2/3 服务端（jfjallid/go-smb）：共享注册 + NTLMv2 认证 + vfs 适配
+internal/sftp/     SFTP 服务端（x/crypto/ssh + pkg/sftp）：公钥 / token 口令认证 + vfs 适配
+internal/webdav/   WebDAV 服务端（x/net/webdav）：挂在 HTTP API 服务上（同一端口，默认 /dav）
 internal/vfs/      文件系统层（SMB / WebDAV / SFTP 共用）：接口定义 + 基于 Share/Inode/Version 的实现
                    （ShareFS = 单 Share，RootFS = 把用户可见的多个 Share 挂在同一个根下）
 ```
@@ -132,6 +136,28 @@ internal/vfs/      文件系统层（SMB / WebDAV / SFTP 共用）：接口定�
 `StatFS` 的容量上限来自 `shares.quota`（单位 MB）：`TotalBytes = quota`，`UsedBytes` 为该 Share
 下所有文件大小之和，`quota = 0` 表示不限制（此时容量以底层存储池为准）。
 
+### Access Layer
+
+`access_tokens` —— 协议访问凭证：由 `internal/token` 管理，SMB / SFTP（以及后续的 WebDAV）
+共用同一张表。
+
+| 表 | 用途 | 关键字段 |
+|---|---|---|
+| `access_tokens` | 一条协议访问凭证 | `user_id` `kind` `name` `token_hash` `nt_hash` `public_key` `fingerprint` `expires_at` `last_used_at` |
+
+一行凭证要么是**随机 token**（`kind = TokenSecret`，可登所有协议），要么是 **SSH 公钥**
+（`kind = TokenPublicKey`，只用于 SFTP）。token 明文只在创建时返回一次，落库的只有两份单向摘要：
+
+- `token_hash`：BLAKE3-256(token)，用于"客户端把 token 原样交上来比对"的协议
+  （SFTP 口令、WebDAV、HTTP API）；
+- `nt_hash`：MD4(UTF-16LE(token))，即 MS-NLMP 的 NTOWFv1——SMB 的 NTLMv2 校验在数学上
+  必须用它（HMAC-MD5 的密钥就是它），换不了别的摘要。
+
+两者都不可逆，而 token 是 32 字节随机串，所以即便库被拖走也无法还原明文或离线爆破
+（MD4 本身早已被攻破，这里是协议兼容要求，保密性来自 token 的熵）。公钥不是秘密，
+明文存 `public_key`，另记 `fingerprint`（SHA256:base64）供查表与展示。
+`expires_at`（Unix 秒，0 = 永不过期）对两种凭证都生效。
+
 ### 枚举
 
 | 类型 | 取值 |
@@ -144,6 +170,7 @@ internal/vfs/      文件系统层（SMB / WebDAV / SFTP 共用）：接口定�
 | `TaskStatus` | `TaskPending`(0) `TaskRunning`(1) `TaskSuccess`(2) `TaskFail`(3) |
 | `StripeQueueType` | `StripeQueueParity`(0) `StripeQueueRebuild`(1) |
 | `CacheStatus` | `NotCached`(0) `Cached`(1) |
+| `AccessTokenKind` | `TokenSecret`(0，通用 token) `TokenPublicKey`(1，仅 SFTP 公钥) |
 
 ## 核心流程
 
@@ -317,10 +344,96 @@ func firstErr(errs []error) error
 它**保证所有任务执行完**（不像 errgroup 那样 fail-fast），因为调用方常需要知道每个下标的成败。
 返回值与 `n` 等长，第 `i` 项即 `fn(i)` 的错误；`fn` 只应写自己下标的槽位。
 
+## 文件协议（SMB / SFTP / WebDAV）
+
+三个协议服务都接 `internal/token` 的 access token 认证、以 `internal/vfs` 为文件系统；
+真正决定能读写什么的是 `share_users` 里的授权，而不是协议层的共享权限。
+
+其中 **SMB 与 SFTP 各自监听一个端口**（见下），**WebDAV 不额外占端口**：它挂在 HTTP API
+服务上（同一个端口、默认 `/dav` 前缀），见下面 WebDAV 一节。
+
+### 启用与配置
+
+端口存在 `settings` 表里，**为空表示不启用**——445 / 22 是特权端口，默认关掉才能让普通用户
+直接 `go run ./cmd/zenofs` 跑起来：
+
+| 配置项 | 默认 | 说明 |
+|---|---|---|
+| `SMB_PORT` | 空（不启用） | 例如 `1445`；标准端口 `445` 需要 root |
+| `SMB_NETBIOS_NAME` | `ZENOFS` | NTLM TargetInfo 里对客户端可见的服务端名 |
+| `SFTP_PORT` | 空（不启用） | 例如 `2222`；标准端口 `22` 需要 root |
+| `SFTP_HOST_KEY_FILE` | 空 | 外部 SSH 主机私钥（PEM）；为空时用自动生成并持久化在 `settings.SFTP_HOST_KEY` 的 ed25519 密钥 |
+| `WEBDAV_PREFIX` | `/dav` | WebDAV 挂在 HTTP API 服务上的前缀；`off` 或 `-` 表示关闭 |
+
+### SMB
+
+- 每个 zenofs Share 注册成一个同名 SMB 共享：`\\<host>\<share>`。共享注册是**启动时快照**，
+  之后新建的 Share 要重启服务才可见。
+- 认证：客户端把"zenofs 用户名 + access token"当账号密码用（NTLMv2）。服务端按用户名取出该用户
+  所有未过期 token 的 NT hash 逐个试算 proof（`internal/smb/auth.go`），过期 token 直接拒绝；
+  默认要求 SMB 签名并支持 SMB 3.x 传输加密（`Options.DisableSigning` / `DisableEncryption` 可关）。
+- 请求映射在 `internal/smb/vfs.go`：CREATE 的 disposition/options 翻成 `vfs.Open` / `vfs.Mkdir`，
+  READ/WRITE 走 `File.ReadAt` / `WriteAt`，SET_INFO 处理截断、删除标记、时间戳与改名；
+  vfs 的 POSIX 错误映射成 NTSTATUS。
+- 挂载鉴权：每个请求按会话登录名查出用户，再经 `RootFS.Mount(share)` 确认该用户对这个 Share 有授权
+  ——没授权的共享连得上，但一操作就是 `STATUS_ACCESS_DENIED`。
+
+### SFTP
+
+- 登录后的根目录就是该用户可见的 Share 列表：`/<share>/...`（`vfs.RootFS`）。
+- 两种认证都支持：SSH 公钥（按 `fingerprint` 匹配）与"用户名 + token"口令。
+- 打开 / 读写 / 列目录 / 改名 / 删除 / mkdir / statvfs 都翻译成 vfs 调用
+  （`internal/sftp/handlers.go`），vfs 错误翻成 `syscall.Errno`，由 pkg/sftp 转成客户端的 `SSH_FX_*`。
+
+### WebDAV
+
+- **与 HTTP API 同一个端口**：`api.NewRouter` 最外层按前缀分发，`/dav/...` 交给 WebDAV、
+  其余交给 chi 的 `/api`。之所以不用 `chi.Mount`：WebDAV 的方法集（`PROPFIND`/`PROPPATCH`/
+  `COPY`/`MOVE`/`LOCK`/`UNLOCK`）不在 chi 预置的方法里，直接挂会被判成 405。
+- **认证**：HTTP Basic，用户名 = zenofs 用户名、密码 = access token。未认证或凭证无效统一回
+  401 + `WWW-Authenticate`（不区分"用户不存在"与"token 不对"）；客户端看到 401 会带凭证重试。
+- **视图**：`/dav/<share>/...`，该用户可见的 Share 列表就是根（`vfs.RootFS`）。
+- **写权限**：进入 WebDAV 处理器之前先按 Share 授权判一次，只读 Share 上的
+  PUT/MKCOL/DELETE/MOVE 直接回 403——x/net 会把 `OpenFile` 的任何错误都当 404，
+  不预判的话客户端只会看到误导性的"资源不存在"。
+- **锁**：`LOCK`/`UNLOCK` 一律成功（`internal/webdav/lock.go`）。vfs 不提供锁（设计如此），
+  服务端不做互斥，只回一个合法的 `opaquelocktoken`，让 Office / Finder 这类要求 LOCK 成功的
+  客户端能正常写入；`LockSystem.Confirm` 放行所有条件（包括 `If` 头里的 token）。
+- `ETag` 由 inode id + 修改时间合成，`Content-Type` 按扩展名给，两者都通过 x/net/webdav 的
+  可选接口暴露，避免服务端为了猜类型去读文件内容。
+
+```bash
+# 根目录 = 该用户可见的 Share 列表
+curl -u alice:$TOKEN -X PROPFIND -H 'Depth: 1' http://localhost:8080/dav/
+# 上传 / 下载
+curl -u alice:$TOKEN -T ./file.bin http://localhost:8080/dav/docs/file.bin
+curl -u alice:$TOKEN -O http://localhost:8080/dav/docs/file.bin
+```
+
+macOS Finder 里"连接服务器"填 `http://<host>:8080/dav`，账号是 zenofs 用户名，密码是 token。
+
+### 凭证管理 API
+
+| 端点 | 说明 |
+|---|---|
+| `POST /api/users/{id}/tokens` | 生成一条随机 token；响应里的 `token` 是明文，**只返回这一次** |
+| `GET /api/users/{id}/tokens?kind=secret\|public_key` | 列出凭证（只有元数据，永不回传摘要） |
+| `POST /api/users/{id}/pubkeys` | 注册一条 SFTP 公钥（`public_key` 用 authorized_keys 行格式） |
+| `DELETE /api/tokens/{id}` | 吊销凭证（硬删除，立即失效） |
+
+请求体里的 `expires_at` 是 Unix 秒，`0` 或省略表示永不过期。
+
+```bash
+curl -X POST localhost:8080/api/users/1/tokens -d '{"name":"laptop"}'
+# => {"id":1,...,"token":"<明文，仅此一次>"}
+```
+
 ## 约定
 
 - 错误一律用 `internal/errs` 的 `ZenoError`（数值 `Code` + 字符串 `StrCode` + `InnerErr`）；
   API 层把 `ZenoError` 映射为 400 + 结构化 JSON，其余 error 映射为 500。
+- **凭证只存单向摘要**：token 明文只出现在创建响应里一次；`access_tokens.token_hash`（BLAKE3）
+  与 `nt_hash`（MD4/UTF-16LE，NTLM 必需）都不可逆，任何接口都不回传这两个字段。
 - `internal/vfs` 的 POSIX 哨兵错误（`ErrNotExist` / `ErrPermission` / `ErrCrossDevice` …）本身就是
   `*errs.ZenoError`，码是 `errs.ECODE_VFS_*`：协议层既能 `errors.Is` 判定后映射成自己的错误码
   （SFTP status / NTSTATUS），也能直接把 `Code` / `StrCode` 回给客户端。`ZenoError.Unwrap` 暴露

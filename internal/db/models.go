@@ -307,3 +307,41 @@ type InodeHistory struct {
 	NewParentId sql.NullInt64  // 移动后的父目录
 	CreatedAt   int64          `gorm:"autoCreateTime;index"`
 }
+
+// ── Access Layer (AccessToken) ──
+
+// AccessTokenKind 访问凭证的形态。
+type AccessTokenKind int8
+
+const (
+	TokenSecret    AccessTokenKind = iota // 0 — 随机 token：SMB / SFTP / WebDAV / HTTP 通用
+	TokenPublicKey                        // 1 — SSH 公钥：仅 SFTP 公钥认证
+)
+
+// AccessToken 是一条协议访问凭证：要么是随机 token（可登所有协议），
+// 要么是 SSH 公钥（仅 SFTP 公钥认证）。两者都绑定一个 users 记录。
+//
+// token 明文只在生成时返回一次，库里只留单向摘要：
+//   - TokenHash：BLAKE3-256(token)，用于"客户端把 token 原样交上来比对"的协议
+//     （SFTP 密码、WebDAV、HTTP API）；
+//   - NTHash：MD4(UTF-16LE(token))，即 MS-NLMP 的 NTOWFv1。SMB 的 NTLMv2 校验
+//     在数学上必须用它（HMAC-MD5 的密钥就是它），无法用别的摘要替代。
+//
+// 两者都不可逆：token 是 32 字节随机串，拿到摘要既不能还原、也无法离线爆破。
+// 公钥不是秘密（本来就随私钥持有者公开），所以 PublicKey 明文存储，
+// 另记 Fingerprint（SHA256:base64）供按 key 查表与展示。
+//
+// ExpiresAt 是过期时间（Unix 秒），0 表示永不过期；两种凭证都用它。
+type AccessToken struct {
+	Id          int64           `gorm:"primaryKey"`
+	UserId      int64           `gorm:"index;not null"` // 归属用户（users.id）
+	Name        string          // 备注，便于用户识别设备/用途
+	Kind        AccessTokenKind // 凭证形态
+	TokenHash   []byte          `gorm:"column:token_hash;index"` // 单向摘要：BLAKE3-256(token)；公钥凭证为 NULL
+	NTHash      []byte          `gorm:"column:nt_hash"`          // 单向摘要：MD4(UTF-16LE(token))，仅 SMB 用；公钥凭证为 NULL
+	PublicKey   string          `gorm:"type:text"`               // SSH 公钥（authorized_keys 单行）；token 凭证为空
+	Fingerprint string          `gorm:"index"`                   // 公钥指纹 SHA256:base64；token 凭证为空
+	ExpiresAt   int64           `gorm:"index"`                   // 过期时间（Unix 秒），0 = 永不过期
+	CreatedAt   int64           `gorm:"autoCreateTime"`
+	LastUsedAt  int64           // 最近一次成功认证的时间（Unix 秒），0 = 从未使用
+}

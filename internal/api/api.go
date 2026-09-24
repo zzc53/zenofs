@@ -10,12 +10,15 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/zzc53/zenofs/internal/db"
 	"github.com/zzc53/zenofs/internal/errs"
 	"github.com/zzc53/zenofs/internal/pool"
+	"github.com/zzc53/zenofs/internal/token"
+	zenowebdav "github.com/zzc53/zenofs/internal/webdav"
 )
 
 // apiError 是统一的 JSON 错误响应结构。
@@ -108,18 +111,62 @@ func readBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 //	POST   /api/pools/{poolId}/chunks    上传一个 chunk
 //	GET    /api/chunks/{id}              读取一个 chunk
 //	PUT    /api/chunks/{id}              覆写一个 chunk
-func NewRouter(pm *pool.PoolManager) *chi.Mux {
+//	POST   /api/users/{id}/tokens        创建访问 token（明文只返回一次）
+//	GET    /api/users/{id}/tokens        列出某用户的凭证
+//	POST   /api/users/{id}/pubkeys       注册 SFTP 公钥
+//	DELETE /api/tokens/{id}              吊销凭证
+//
+// WebDAV 挂在同一个 HTTP 服务上（同一端口，默认 /dav 前缀，见 RouterOptions）。
+//
+// 返回 http.Handler 而不是 *chi.Mux：WebDAV 的方法集（PROPFIND / COPY / MOVE /
+// LOCK ...）不在 chi 预置的方法里，直接 Mount 会被 chi 判成 405，所以最外层按
+// 前缀先分发，再落到 chi 的 /api 上。日志与 panic 恢复统一包在最外层。
+func NewRouter(pm *pool.PoolManager, tokens *token.Manager, opts RouterOptions) http.Handler {
 	r := chi.NewRouter()
-	r.Use(middleware.Logger)
-	r.Use(middleware.Recoverer)
-
 	r.Route("/api", func(r chi.Router) {
 		registerPoolRoutes(r, pm)
 		registerDiskRoutes(r, pm)
 		registerChunkRoutes(r, pm)
+		registerTokenRoutes(r, tokens)
 	})
 
-	return r
+	prefix := webdavPrefix(opts.WebDAVPrefix)
+	if prefix == "" {
+		return middleware.Logger(middleware.Recoverer(r))
+	}
+
+	// WebDAV 与 REST API 共用一个 HTTP 服务：不额外监听端口，
+	// 客户端用 Basic（用户名 + access token）认证，视图是 /<share>/...。
+	dav := zenowebdav.New(pm, tokens, prefix)
+	dispatch := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == prefix || strings.HasPrefix(req.URL.Path, prefix+"/") {
+			dav.ServeHTTP(w, req)
+			return
+		}
+		r.ServeHTTP(w, req)
+	})
+	return middleware.Logger(middleware.Recoverer(dispatch))
+}
+
+// RouterOptions 是 HTTP 路由的可选项。
+type RouterOptions struct {
+	// WebDAVPrefix 是 WebDAV 的挂载前缀：空表示默认的 zenowebdav.DefaultPrefix（"/dav"），
+	// "off" 或 "-" 表示不挂载。不以 "/" 开头时会自动补上。
+	WebDAVPrefix string
+}
+
+// webdavPrefix 解析 WebDAV 的挂载前缀；返回空串表示关闭。
+func webdavPrefix(v string) string {
+	switch v = strings.TrimSpace(v); v {
+	case "off", "-":
+		return ""
+	case "":
+		return zenowebdav.DefaultPrefix
+	}
+	if !strings.HasPrefix(v, "/") {
+		v = "/" + v
+	}
+	return strings.TrimSuffix(v, "/")
 }
 
 // registerPoolRoutes 注册存储池相关端点。

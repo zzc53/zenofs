@@ -31,6 +31,7 @@ func TestNewSQLiteAndAutoMigrate(t *testing.T) {
 		"pools", "disks", "chunks", "stripes", "write_queues", "stripe_queues", "read_caches",
 		"settings", "tasks", "users", "shares", "share_users",
 		"inodes", "versions", "version_chunks", "inode_histories",
+		"access_tokens",
 	}
 	var names []string
 	if err := m.DB.Raw("SELECT name FROM sqlite_master WHERE type = 'table'").Scan(&names).Error; err != nil {

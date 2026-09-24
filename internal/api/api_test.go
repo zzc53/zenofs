@@ -11,6 +11,7 @@ import (
 	"github.com/zzc53/zenofs/internal/db"
 	"github.com/zzc53/zenofs/internal/pool"
 	"github.com/zzc53/zenofs/internal/testutil"
+	"github.com/zzc53/zenofs/internal/token"
 )
 
 // newTestServer 起一个真实的 chi 路由 + 临时库 + 本地盘 handler。
@@ -18,7 +19,7 @@ func newTestServer(t *testing.T) (*testutil.Env, *httptest.Server) {
 	t.Helper()
 	env := testutil.New(t)
 	pm := pool.New(env.DB, []pool.ChunkHandler{pool.NewLocalChunkHandler()})
-	srv := httptest.NewServer(NewRouter(pm))
+	srv := httptest.NewServer(NewRouter(pm, token.NewManager(env.DB), RouterOptions{}))
 	t.Cleanup(srv.Close)
 	return env, srv
 }

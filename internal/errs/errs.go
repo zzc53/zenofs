@@ -42,6 +42,13 @@ const (
 	ECODE_VFS_LOOP          = 27 // 符号链接层数过多
 	ECODE_VFS_CROSS_DEVICE  = 28 // 跨挂载点操作（跨 Share 的 Rename/Copy）
 	ECODE_VFS_ENCRYPTED     = 29 // Share 启用了加密，但会话里没有可用密钥（要用口令打开）
+
+	// 访问凭证（internal/token）的错误。
+	ECODE_TOKEN_INVALID   = 30 // 凭证无效（token 摘要对不上）
+	ECODE_TOKEN_EXPIRED   = 31 // 凭证已过期
+	ECODE_TOKEN_NOT_FOUND = 32 // 凭证不存在
+	ECODE_TOKEN_BAD_KEY   = 33 // SSH 公钥格式非法
+	ECODE_TOKEN_BAD_USER  = 34 // 归属用户不存在
 )
 
 // ── 错误码（字符串） ──
@@ -81,6 +88,13 @@ const (
 	ESTR_VFS_LOOP          = "VFS_LOOP"
 	ESTR_VFS_CROSS_DEVICE  = "VFS_CROSS_DEVICE"
 	ESTR_VFS_ENCRYPTED     = "VFS_ENCRYPTED"
+
+	// 访问凭证（与 ECODE_TOKEN_* 一一对应）
+	ESTR_TOKEN_INVALID   = "TOKEN_INVALID"
+	ESTR_TOKEN_EXPIRED   = "TOKEN_EXPIRED"
+	ESTR_TOKEN_NOT_FOUND = "TOKEN_NOT_FOUND"
+	ESTR_TOKEN_BAD_KEY   = "TOKEN_BAD_KEY"
+	ESTR_TOKEN_BAD_USER  = "TOKEN_BAD_USER"
 )
 
 // ZenoError 是系统的标准错误类型，包含数值码、字符串码和上下文。
@@ -124,3 +138,16 @@ func (e *ZenoError) Error() string {
 // Unwrap 暴露被包装的原始错误，让 errors.Is / errors.As 能穿透到它。
 // 例：vfs 把 POSIX 哨兵错误包成 ZenoError 后，调用方仍可用 errors.Is 判定。
 func (e *ZenoError) Unwrap() error { return e.InnerErr }
+
+// Is 让 errors.Is 按错误码比较两个 ZenoError：同码即视为同一类错误。
+//
+// 这样 FromError 包装出来的 ZenoError（带原始错误）与 errs.New 造的哨兵实例
+// 也能匹配上：errors.Is(FromError(err, ECODE_TOKEN_BAD_KEY, ...), token.ErrBadKey) 为真。
+// 按码比较是刻意的——错误码就是这个包对外的契约，实例指针不是。
+func (e *ZenoError) Is(target error) bool {
+	t, ok := target.(*ZenoError)
+	if !ok {
+		return false
+	}
+	return e.Code == t.Code
+}

@@ -58,7 +58,8 @@ func (m *DbManager) Close() error {
 // AutoMigrate 自动迁移给定的模型。
 func (m *DbManager) AutoMigrate() error {
 	if err := m.DB.AutoMigrate(&Pool{}, &Disk{}, &Chunk{}, &Stripe{}, &WriteQueue{}, &StripeQueue{}, &ReadCache{},
-		&Setting{}, &Task{}, &User{}, &Share{}, &ShareUser{}, &Inode{}, &Version{}, &VersionChunk{}, &InodeHistory{}); err != nil {
+		&Setting{}, &Task{}, &User{}, &Share{}, &ShareUser{}, &Inode{}, &Version{}, &VersionChunk{}, &InodeHistory{},
+		&AccessToken{}); err != nil {
 		return err
 	}
 	// inodes: 未删除的记录同一目录下不允许重名
