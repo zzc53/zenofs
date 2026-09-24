@@ -27,6 +27,9 @@ type shareView struct {
 	Encryption  int8   `json:"encryption"`
 	CreatedBy   int64  `json:"created_by"`
 	CreatedAt   int64  `json:"created_at"`
+	// 保留策略：回收站保留时长（小时）与每文件版本数上限，0 都表示不限。
+	RecycleTtlHours int64 `json:"recycle_ttl_hours"`
+	VersionKeep     int64 `json:"version_keep"`
 	// Encrypted 表示这个 Share 启用了加密；Unlocked 表示密钥此刻是否在进程内存里
 	// （LUKS 式的"已打开"状态，重启或 lock 之后会变回 false）。
 	//
@@ -42,16 +45,18 @@ type shareView struct {
 // Unlocked 来自进程级密钥表，所以必须挂在 server 上。
 func (s *server) viewOfShare(sh *db.Share, perm *db.SharePermission) shareView {
 	v := shareView{
-		Id:          sh.Id,
-		Name:        sh.Name,
-		PoolId:      sh.PoolId,
-		QuotaMb:     sh.Quota,
-		Compression: sh.Compression,
-		Encryption:  sh.Encryption,
-		CreatedBy:   sh.CreatedBy,
-		CreatedAt:   sh.CreatedAt,
-		Encrypted:   sh.Encryption != vfs.EncryptionNone,
-		Unlocked:    vfs.ShareUnlocked(s.pm, sh.Id),
+		Id:              sh.Id,
+		Name:            sh.Name,
+		PoolId:          sh.PoolId,
+		QuotaMb:         sh.Quota,
+		Compression:     sh.Compression,
+		Encryption:      sh.Encryption,
+		CreatedBy:       sh.CreatedBy,
+		CreatedAt:       sh.CreatedAt,
+		RecycleTtlHours: sh.RecycleTtlHours,
+		VersionKeep:     sh.VersionKeep,
+		Encrypted:       sh.Encryption != vfs.EncryptionNone,
+		Unlocked:        vfs.ShareUnlocked(s.pm, sh.Id),
 	}
 	if perm != nil {
 		v.Permission = permissionName(*perm)
@@ -123,12 +128,14 @@ func (s *server) registerShareRoutes(r chi.Router) {
 			return
 		}
 		var body struct {
-			Name        string `json:"name"`
-			PoolId      int64  `json:"pool_id"`
-			QuotaMb     int64  `json:"quota_mb"`
-			Compression int8   `json:"compression"`
-			Encryption  int8   `json:"encryption"`
-			Password    string `json:"password"`
+			Name            string `json:"name"`
+			PoolId          int64  `json:"pool_id"`
+			QuotaMb         int64  `json:"quota_mb"`
+			Compression     int8   `json:"compression"`
+			Encryption      int8   `json:"encryption"`
+			Password        string `json:"password"`
+			RecycleTtlHours int64  `json:"recycle_ttl_hours"`
+			VersionKeep     int64  `json:"version_keep"`
 		}
 		if !decodeBody(w, r, &body) {
 			return
@@ -150,6 +157,10 @@ func (s *server) registerShareRoutes(r chi.Router) {
 			badRequest(w, "compression 只支持 0（无）/ 1（zstd）")
 			return
 		}
+		if body.RecycleTtlHours < 0 || body.VersionKeep < 0 {
+			badRequest(w, "recycle_ttl_hours 与 version_keep 不能为负（0 表示不限）")
+			return
+		}
 		// 加密必须在"还是空的 Share"上一次做成（类似 LUKS 的 luksFormat）：给了 password
 		// 就启用加密并立刻解锁；已有数据的 Share 不能事后加密——老 chunk 还是明文，
 		// 读的时候却按密文解，数据就毁了。
@@ -162,12 +173,14 @@ func (s *server) registerShareRoutes(r chi.Router) {
 			encryption = vfs.EncryptionAESGCM
 		}
 		sh := db.Share{
-			Name:        name,
-			PoolId:      body.PoolId,
-			Quota:       body.QuotaMb,
-			Compression: body.Compression,
-			Encryption:  encryption,
-			CreatedBy:   userOf(r).Id,
+			Name:            name,
+			PoolId:          body.PoolId,
+			Quota:           body.QuotaMb,
+			Compression:     body.Compression,
+			Encryption:      encryption,
+			RecycleTtlHours: body.RecycleTtlHours,
+			VersionKeep:     body.VersionKeep,
+			CreatedBy:       userOf(r).Id,
 		}
 		if err := s.pm.DbManager.DB.Create(&sh).Error; err != nil {
 			if isUniqueViolation(err) {
@@ -253,8 +266,10 @@ func (s *server) registerShareRoutes(r chi.Router) {
 			return
 		}
 		var body struct {
-			QuotaMb     *int64 `json:"quota_mb"`
-			Compression *int8  `json:"compression"`
+			QuotaMb         *int64 `json:"quota_mb"`
+			Compression     *int8  `json:"compression"`
+			RecycleTtlHours *int64 `json:"recycle_ttl_hours"`
+			VersionKeep     *int64 `json:"version_keep"`
 		}
 		if !decodeBody(w, r, &body) {
 			return
@@ -266,6 +281,20 @@ func (s *server) registerShareRoutes(r chi.Router) {
 				return
 			}
 			updates["quota"] = *body.QuotaMb
+		}
+		if body.RecycleTtlHours != nil {
+			if *body.RecycleTtlHours < 0 {
+				badRequest(w, "recycle_ttl_hours 不能为负（0 表示不自动清除）")
+				return
+			}
+			updates["recycle_ttl_hours"] = *body.RecycleTtlHours
+		}
+		if body.VersionKeep != nil {
+			if *body.VersionKeep < 0 {
+				badRequest(w, "version_keep 不能为负（0 表示不限）")
+				return
+			}
+			updates["version_keep"] = *body.VersionKeep
 		}
 		if body.Compression != nil {
 			if *body.Compression != vfs.CompressionNone && *body.Compression != vfs.CompressionZstd {
@@ -462,6 +491,11 @@ func (s *server) registerShareRoutes(r chi.Router) {
 			respondErr(w, err)
 			return
 		}
+		breakdown, err := fs.UsageBreakdown(r.Context())
+		if err != nil {
+			respondErr(w, err)
+			return
+		}
 		respondJSON(w, http.StatusOK, map[string]any{
 			"share_id":    sh.Id,
 			"quota_mb":    sh.Quota,
@@ -470,6 +504,16 @@ func (s *server) registerShareRoutes(r chi.Router) {
 			"free_bytes":  info.FreeBytes,
 			"total_files": info.TotalFiles,
 			"free_files":  info.FreeFiles,
+			// 下面四个是"盘上真实占用"的去重口径（按分片统计），与 used_bytes
+			// 不是一回事：used_bytes 是"所有 inode 当前版本大小之和"，它把回收站
+			// 也算进去、却漏掉历史版本；真实占用正好相反。
+			//
+			// reclaimable_bytes 是"清空回收站就能回收的量"，是这里唯一的保守估计
+			// （孤儿分片无法归属到 Share，只在池级 /usage 里统计）。
+			"current_bytes":     breakdown.CurrentBytes,
+			"history_bytes":     breakdown.HistoryBytes,
+			"recycle_bytes":     breakdown.RecycleBytes,
+			"reclaimable_bytes": breakdown.RecycleBytes,
 		})
 	})
 
@@ -624,43 +668,24 @@ func (s *server) listShares(u *db.User) ([]db.Share, map[int64]db.SharePermissio
 	return shares, perms, nil
 }
 
-// deleteShareMeta 删除 Share 及其全部文件元数据（inode/version/version_chunk）与授权。
+// deleteShareMeta 删除 Share 及其全部文件元数据与授权，并回收它的存储层分片。
 //
-// 存储层的 chunk 不物理删除（pool 没有单块删除能力），留给后续 GC，与回收站的
-// 彻底删除保持一致。
+// 文件数据（inode/version/version_chunk/审计历史）与分片回收交给 vfs.PurgeShare，
+// 它和回收站的"彻底删除"共用同一条释放路径；ShareUser / Share 行属于权限与配置，
+// 在这里删。
 func (s *server) deleteShareMeta(shareId int64) error {
-	return s.pm.DbManager.Tx(func(tx *gorm.DB) error {
-		var inodeIds, versionIds []int64
-		if err := tx.Model(&db.Inode{}).Where("share_id = ?", shareId).Pluck("id", &inodeIds).Error; err != nil {
-			return errs.DBQuery(err)
-		}
-		if len(inodeIds) > 0 {
-			if err := tx.Model(&db.Version{}).Where("inode_id IN ?", inodeIds).Pluck("id", &versionIds).Error; err != nil {
-				return errs.DBQuery(err)
-			}
-			if len(versionIds) > 0 {
-				if err := tx.Where("version_id IN ?", versionIds).Delete(&db.VersionChunk{}).Error; err != nil {
-					return errs.DBQuery(err)
-				}
-			}
-			if err := tx.Where("inode_id IN ?", inodeIds).Delete(&db.Version{}).Error; err != nil {
-				return errs.DBQuery(err)
-			}
-			if err := tx.Where("id IN ?", inodeIds).Delete(&db.Inode{}).Error; err != nil {
-				return errs.DBQuery(err)
-			}
-			if err := tx.Where("inode_id IN ?", inodeIds).Delete(&db.InodeHistory{}).Error; err != nil {
-				return errs.DBQuery(err)
-			}
-		}
+	if _, err := vfs.PurgeShare(s.pm, shareId); err != nil {
+		return err
+	}
+	if err := s.pm.DbManager.Tx(func(tx *gorm.DB) error {
 		if err := tx.Where("share_id = ?", shareId).Delete(&db.ShareUser{}).Error; err != nil {
-			return errs.DBQuery(err)
+			return err
 		}
-		if err := tx.Delete(&db.Share{}, shareId).Error; err != nil {
-			return errs.DBQuery(err)
-		}
-		return nil
-	})
+		return tx.Delete(&db.Share{}, shareId).Error
+	}); err != nil {
+		return errs.DBQuery(err)
+	}
+	return nil
 }
 
 // isUniqueViolation 判断是否是唯一索引冲突（各驱动都给不出稳定错误码，只能看文本）。

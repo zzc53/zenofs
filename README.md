@@ -91,10 +91,10 @@ SQLite 库通过 `internal/testutil` 建好并 `AutoMigrate`，不起任何 mock
 | `internal/hash` | 摘要定长/确定性、`SumArray` 与 `Sum` 一致、`Equal` 的"没有期望值就不校验"语义 | 100% |
 | `internal/errs` | 数值码与字符串码唯一、`Error()` 文案、`errors.As` 取出 `*ZenoError`、`Unwrap` 让 `errors.Is` 穿透包装 | 100% |
 | `internal/config` | 配置优先级 argv > `ZENOFS_DSN` > 默认值 | 100% |
-| `internal/db` | DSN 分支、`AutoMigrate` 建表/幂等/默认配置、`GetSetting` | 93% |
-| `internal/pool` | 池/盘参数校验、chunk 写入-读取-覆写、预留槽位复用、write queue → stripe queue 搬运、RS parity 编码（与 `reedsolomon` 独立复算比对）、坏块重建与换盘恢复、读缓存落盘与冷却淘汰、`parallelEach` 并发上限 | 77% |
-| `internal/vfs` | 路径规范化与 `checkName`、zstd 往返与压缩效果、AES-GCM 加解密与篡改检测、口令生命周期、**进程级密钥表（解锁后跨实例可读、上锁后读写均失败）**、回收站（列出/恢复/彻底删除/父目录已删时回到根）、ShareFS 命名空间/权限/配额/稀疏/版本提交/快照隔离、切片级写时复制、Truncate 对边界、`RootFS` 根聚合、**错误码标准化** | 81% |
-| `internal/api` | 真实 HTTP 服务 + `httptest`：bootstrap/登录/JWT（含 401/403/404/409/423 映射）、用户与 Share 管理、文件上下传与回收站、加密 Share 的解锁/上锁、`?access_token=` 鉴权与日志脱敏、静态资源挂载与保留路径、建池/加盘/换盘/重建/chunk 读写 | 64% |
+| `internal/db` | DSN 分支、`AutoMigrate` 建表/幂等/默认配置、`GetSetting`、`Compact`（VACUUM） | 87% |
+| `internal/pool` | 池/盘参数校验、chunk 写入-读取-覆写、预留槽位复用、write queue → stripe queue 搬运、RS parity 编码（与 `reedsolomon` 独立复算比对）、坏块重建与换盘恢复、读缓存落盘与冷却淘汰、**分片释放（空槽回滚 + 引用检查 + parity 分情况处理）与孤儿回收（保护期/写队列过滤）**、池占用统计、`parallelEach` 并发上限 | 75% |
+| `internal/vfs` | 路径规范化与 `checkName`、zstd 往返与压缩效果、AES-GCM 加解密与篡改检测、口令生命周期、**进程级密钥表（解锁后跨实例可读、上锁后读写均失败）**、回收站（列出/恢复/彻底删除/父目录已删时回到根）、ShareFS 命名空间/权限/配额/稀疏/版本提交/快照隔离、切片级写时复制、Truncate 对边界、`RootFS` 根聚合、**错误码标准化**、**彻底删除的分片回收、按分片去重的占用统计、保留策略（回收站 TTL / 版本裁剪）** | 77% |
+| `internal/api` | 真实 HTTP 服务 + `httptest`：bootstrap/登录/JWT（含 401/403/404/409/423 映射）、用户与 Share 管理、文件上下传与回收站、加密 Share 的解锁/上锁、`?access_token=` 鉴权与日志脱敏、静态资源挂载与保留路径、建池/加盘/换盘/重建/chunk 读写、池占用与手动 GC、`/db/compact` | 63% |
 | `internal/auth` | bcrypt 密码、TOTP 二次验证、JWT 签发/过期/篡改/用户被删、用户 CRUD 与连带清理、密钥与 TTL 的配置读取 | 83% |
 | `internal/otp` | RFC 6238 官方测试向量、±1 步长漂移、坏输入、密钥大小写/空格/填充容错、`otpauth://` URI | 94% |
 | `internal/token` | token 生成与唯一性、只落单向摘要（BLAKE3 + NT hash）、过期判定、公钥注册与指纹、跨用户拒绝、SMB 候选摘要 | 87% |
@@ -104,9 +104,10 @@ SQLite 库通过 `internal/testutil` 建好并 `AutoMigrate`，不起任何 mock
 | `internal/webui` | 静态资源与 SPA 回退、`index.html` 禁缓存、产物文件长缓存、路径穿越回退 | 73% |
 
 **不测**：后台 worker 的定时/异步时序
-（`StartParityWorker`、`StartCacheCleaner` 的 ticker 循环、并行调度的等待逻辑）——这类用例要等时钟、
+（`StartParityWorker`、`StartCacheCleaner`、`StartOrphanGC`、`StartRetention` 的 ticker 循环、
+并行调度的等待逻辑）——这类用例要等时钟、
 容易 flaky。它们背后的同步内核（`calculateStripeParity`、`rebuildStripe`、`cleanupColdCache`、
-`Flush`）都由上面的用例直接驱动，逻辑本身是覆盖到的。
+`Flush`、`GarbageCollect`、`SweepRecycle`、`SweepVersions`）都由上面的用例直接驱动，逻辑本身是覆盖到的。
 
 ## 目录结构
 
@@ -293,9 +294,10 @@ internal/vfs/      文件系统层（SMB / WebDAV / SFTP 共用）：接口定�
 运行半途中断的孤片（写盘意图记下了、结果没来得及记），对应的 chunk 仍是 `Reserved` 槽位，会被后续
 写入当作可复用的位置，所以丢掉等价于"那次写入没提交"。
 
-漏掉这一步的后果值得记一笔：`Flush` 是项目里**唯一**往 `stripe_queues` 投递的入口，
+漏掉这一步的后果值得记一笔：`Flush` 是**写入路径**上唯一往 `stripe_queues` 投递的入口，
 少了它 `stripe_queues` 永远是空的，校验块永远停在 `Reserved` 空占位（校验盘上只有一个预分配的
-空文件）——冗余保护看着有、其实完全没生效。
+空文件）——冗余保护看着有、其实完全没生效。（`stripe_queues` 还有第二个投递点：分片被释放后
+要按条带重排一次 parity，见"空间回收与保留策略"。）
 
 1. `Flush`（单事务）：
    - 取 `write_queues`（按 `chunk_id, id` 排序），找出**相邻**的 `Pending → Success/Fail` 对，即"一轮写完"；
@@ -382,8 +384,9 @@ SMB / WebDAV / SFTP 这类协议有统一的根目录：客户端连上来要先
   是编码**之后**的字节，而池会拒绝超过 chunk 上限的块——不留这点余量，"文件大小正好是切片
   整数倍"时的满切片会被 `CHUNK_SIZE_EXCEED` 拒收。未压缩未加密时开销为 0，切片精确等于
   池的 `chunk_size`。
-  新版本会先继承旧版本的全部切片映射，未触及的 Idx 直接沿用旧 chunk（chunk 不可变且不回收，
-  多版本共享是安全的）。新切片实时写入存储池并 upsert `VersionChunk`；
+  新版本会先继承旧版本的全部切片映射，未触及的 Idx 直接沿用旧 chunk（chunk 内容不可变，
+  多版本共享是安全的；真正把分片回收掉只发生在彻底删除、且已确认没有任何版本再引用它时，
+  见"空间回收与保留策略"）。新切片实时写入存储池并 upsert `VersionChunk`；
   同一 Idx 反复写时只在内存里改一份明文缓冲，切到别的 Idx 或 Close/Sync 时才落盘。
 - **提交**：`Version.Size` 与 `Inode.VersionId` 在 Close 时一次性切换；打开后没写过任何字节
   则丢弃那个空版本。`SetAttr` 的 Size 走同一条 Truncate 路径。
@@ -410,6 +413,55 @@ SMB / WebDAV / SFTP 这类协议有统一的根目录：客户端连上来要先
   这个错误说的是"该 Share 是加密的、当前会话没有密钥"，与 `Locker` 的"锁被占用"（`ErrBusy`）是两回事。
 
 > 尚未做：修改口令 / 密钥轮换、派生参数的版本化（迭代次数写死，将来调整需要兼容策略）。
+
+### 空间回收与保留策略
+
+删除文件分两步：`Remove` 只是标记"已删除"（进回收站，数据、配额、磁盘都还占着），
+`Purge`（彻底删除）才真删。**只有第二步会回收磁盘**，而且是三层一起动：
+
+1. **元数据**：`inodes` / `versions` / `version_chunks` 里属于这棵子树的行；
+2. **分片**：这些版本引用到的 chunk 里，**已经没有任何版本再引用**的那些会被回滚成
+   `ChunkReserved` 空槽并删掉磁盘文件（`pool.ReleaseChunks`）。这里保留 chunk 行、只改状态：
+   条带的 data/parity 数量与盘分布是分配与重建的前提，删行会让它与池配置对不上。
+   回滚出来的空槽随后被写入直接复用（见"分片创建"的 Phase 1）；
+3. **parity**：被释放分片所在的条带要重排一次 parity——陈旧 parity 会在盘故障时解出
+   **错误的旧数据**，比没有校验更糟。条带里还有别的数据时 parity 文件原样保留、只排队重算
+   （恢复能力优先，见"故障重建"）；整条被释放空时才删掉 parity 文件，因为那时没有数据可保护，
+   留着只会把被删内容的痕迹永久留在盘上。
+
+判断"还有没有引用"必须和"删引用"在**同一个事务**里：`fileHandle.Close` 会把旧版本未触及的
+切片继承成新版本的 `version_chunks`（写时复制），跨事务就会漏掉这个新引用、把还在用的数据
+回收掉。磁盘文件的删除放在事务提交之后，而且回滚槽位时会顺手换一个新路径——否则"删旧文件"
+会撞上"并发写入复用同一槽位"，把刚写进去的新数据删掉。
+
+三条触发路径共用同一段逻辑：
+
+| 触发 | 入口 | 说明 |
+|---|---|---|
+| 回收站彻底删除 | `vfs.Purge` / `PurgeAll` | 用户清某一条或清空回收站 |
+| 删除 Share | `vfs.PurgeShare` | 以前只删元数据，整个 Share 的分片会永久留在盘上 |
+| 孤儿回收 | `pool.GarbageCollect` | 后台每 30 分钟一轮，另有 `POST /api/pools/{id}/gc` 手动触发，捞历史遗留的孤儿 |
+
+**孤儿回收的三重过滤**（`pool.orphanQuery`）：只认 `type=data` 的分片（parity 永远不在
+`version_chunks` 里，只按"无引用"判断会把它全判成孤儿）；只认创建时间早于保护期（10 分钟）的
+（写入路径是"分配槽位 → 落盘 → 写引用"，中间那一瞬天然无引用）；且 `write_queues` 里没有记录
+（那段可能正在写）。
+
+**保留策略按 Share 配置**（`shares.recycle_ttl_hours` / `shares.version_keep`，0 都表示不限）：
+
+- 回收站 TTL：超期的软删条目被彻底删除（连带分片回收）。判定用 `inode.updated_at`——
+  恢复会刷新它，所以"恢复了再删"重新计时；
+- 版本上限：每个文件只留最近 N 个版本，**当前版本一定保留**。它未必是 id 最大的那个
+  （`RestoreVersion` 会把旧版本指回去），按"留最新的 N 个"一刀切会删掉活数据。
+
+两者都不在写入路径上做（免得删掉正被读句柄引用的旧版本），由 `vfs.StartRetention` 每 30 分钟
+扫一轮；被裁掉的版本无法再回滚，这是它们的代价。
+
+**"删干净"到什么程度**：SQLite 开了 `secure_delete`（删行即覆写，内容不留在空闲页里），
+要把空闲页还给文件系统用 `POST /api/db/compact`（`VACUUM`）。仍做不到的是介质级不可恢复：
+文件系统（APFS 的 CoW、日志）与 SSD 的 wear leveling 都不保证覆写落在同一个物理块；加密 Share
+的密钥也仍是**口令派生**的（落库的只有 salt 与校验值），所以没有 crypto-erase。要合规级销毁，
+得整盘擦除，或改成"随机数据密钥 + 口令包裹"的模型。
 
 ### 读缓存
 
@@ -447,13 +499,13 @@ func firstErr(errs []error) error
 |---|---|
 | 引导向导 | 四步：首个管理员 → 存储池 → 磁盘 → 共享。OTP 密钥**进页面就在浏览器里生成好**（带二维码、可点“换一个密钥”重新生成，密钥不经过任何 URL），第 1 步建完管理员会自动用它算码登录 |
 | 登录 | 用户名 + 密码 + 六位验证码（TOTP） |
-| 文件 | 共享切换、面包屑、目录列表、拖拽或选择上传、下载、新建文件夹、改名、删除（进回收站）、配额用量条、加密共享的解锁/取消解密 |
-| 回收站 | 列出、恢复、彻底删除、清空 |
-| 管理 · 共享 | 新建（可选口令启用加密）、改配额/压缩、授权（read/write/admin）、解锁/取消解密、强制删除 |
+| 文件 | 共享切换、面包屑、目录列表、拖拽或选择上传、下载、新建文件夹、改名、删除（进回收站）、配额用量条 + 按分片统计的真实占用分解（在用 / 历史版本 / 回收站）与可回收量、加密共享的解锁/取消解密 |
+| 回收站 | 列出、恢复、彻底删除、清空（彻底删除与清空都会真的回收磁盘） |
+| 管理 · 共享 | 新建（可选口令启用加密，可设回收站保留时长与每文件版本上限）、改配额/压缩、**改保留策略**、授权（read/write/admin）、解锁/取消解密、强制删除 |
 | 管理 · 用户 | 新建（角色 + OTP）、改密码/角色、重置 OTP（新密钥只显示一次）、删除 |
 | 文件 · 历史 | 文件/目录的版本列表与变更记录；恢复到任一版本（只读共享禁用） |
 | 回收站 · 历史 | 被删条目同样能查看版本与变更记录，再决定还原或彻底删除 |
-| 管理 · 存储池 | 建池、加盘（先选用途：数据盘 / 缓存盘；数据盘且池里已有盘时才出现“计入校验分片”，池里没有数据盘时缓存盘不可选）、下线、换盘、重建（reconstruct）、删除缓存盘、后台任务列表 |
+| 管理 · 存储池 | 建池、加盘（先选用途：数据盘 / 缓存盘；数据盘且池里已有盘时才出现“计入校验分片”，池里没有数据盘时缓存盘不可选）、下线、换盘、重建（reconstruct）、删除缓存盘、**真实占用与可回收孤儿、手动回收（GC）**、后台任务列表 |
 | 管理 · 凭证 | 生成访问 token（明文只显示一次）、注册 SFTP 公钥、吊销 |
 
 ```bash
@@ -517,9 +569,10 @@ npm test          # 纯函数测试（前端算的 TOTP 必须与服务端一致
 | `DELETE /api/shares/{id}/files?path=/a.txt` | 删除（软删除，进回收站） |
 | `POST /api/shares/{id}/folders` | 新建目录 `{"path":"/dir"}` |
 | `POST /api/shares/{id}/rename` | 改名 / 移动 `{"from":"/a","to":"/b"}` |
+| `GET /api/shares/{id}/usage` | 配额用量 + 按分片去重统计的真实占用（在用 / 历史版本 / 回收站） |
 | `GET /api/shares/{id}/recycle` | 回收站列表（含删除时间与删除者） |
 | `POST /api/shares/{id}/recycle/{inodeId}/restore` | 恢复（原父目录没了就回到 Share 根；同名冲突回 409） |
-| `DELETE /api/shares/{id}/recycle/{inodeId}` | 彻底删除（清掉元数据；存储层 chunk 留给后续 GC） |
+| `DELETE /api/shares/{id}/recycle/{inodeId}` | 彻底删除：清元数据，并把没人再引用的分片从盘上回收 |
 | `DELETE /api/shares/{id}/recycle` | 清空回收站 |
 
 **权限**：能不能读写 Share 只看 `share_users` 里的授权，管理员也不例外——
@@ -561,6 +614,9 @@ npm test          # 纯函数测试（前端算的 TOTP 必须与服务端一致
 | `GET /api/shares/{id}/inodes/{inodeId}/history` | 元数据变更记录（创建/改名/移动/删除/恢复） |
 | `POST /api/shares/{id}/versions/{versionId}/restore` | 恢复到某个版本（需写权限） |
 | `POST /api/pools/{id}/rebuild` | 投递条带重建（reconstruct；`/reconstruct` 是同义别名） |
+| `GET /api/pools/{id}/usage` | 池的真实占用：data / parity 字节数、已用与空闲槽位、可回收的孤儿分片 |
+| `POST /api/pools/{id}/gc` | 立刻回收该池的孤儿分片，返回 `{"scanned","released","freed_bytes"}` |
+| `POST /api/db/compact` | 压实数据库（SQLite `VACUUM`），把彻底删除留下的空闲页还给文件系统 |
 | `POST /api/pools/{poolId}/chunks`、`GET`/`PUT` `/api/chunks/{id}` | 分片级读写（存储层内部用） |
 
 ### 访问凭证（SMB / SFTP / WebDAV 用）

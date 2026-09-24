@@ -189,6 +189,8 @@ func readBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 //	POST   /api/pools/{poolId}/disks      给存储池添加磁盘（type=data|cache，data 可选 add_parity）
 //	POST   /api/pools/{id}/rebuild        投递条带重建作业（重建 / reconstruct）
 //	POST   /api/pools/{id}/reconstruct    同 rebuild
+//	GET    /api/pools/{id}/usage          池的真实占用（data/parity/槽位 + 可回收孤儿）
+//	POST   /api/pools/{id}/gc             立刻回收该池的孤儿分片
 //	PUT    /api/disks/{diskId}/swap       替换故障磁盘路径
 //	DELETE /api/disks/{diskId}            删除缓存盘（连同缓存文件与记录）
 //	POST   /api/pools/{poolId}/chunks     上传一个 chunk
@@ -350,7 +352,7 @@ func webdavPrefix(v string) string {
 	return strings.TrimSuffix(v, "/")
 }
 
-// registerPoolRoutes 注册存储池相关端点。
+// registerPoolRoutes 注册存储池与存储维护相关端点（池、占用统计、孤儿回收、数据库压实）。
 func (s *server) registerPoolRoutes(r chi.Router) {
 	// GET /api/pools —— 列出存储池
 	r.Get("/pools", func(w http.ResponseWriter, r *http.Request) {
@@ -429,6 +431,81 @@ func (s *server) registerPoolRoutes(r chi.Router) {
 	r.Post("/pools/{id}/rebuild", s.handleRebuildPool)
 	// POST /api/pools/{id}/reconstruct —— 与 rebuild 同义（换个更常见的叫法）
 	r.Post("/pools/{id}/reconstruct", s.handleRebuildPool)
+
+	// GET /api/pools/{id}/usage —— 池的真实占用（分片在盘上的实际大小，管理员）
+	//
+	// 与 Share 的 /usage 不同：这里不涉及配额，也不做归属划分，直接报盘上
+	// 有多少字节的 data / parity、占用了多少槽位、还剩多少预分配空槽；
+	// orphan_* 是"谁都不引用、可以直接回收"的存量（保护期内的不算）。
+	r.Get("/pools/{id}/usage", func(w http.ResponseWriter, r *http.Request) {
+		if !requireAdmin(w, r) {
+			return
+		}
+		id, ok := pathID(w, r, "id")
+		if !ok {
+			return
+		}
+		usage, err := s.pm.Usage(id)
+		if err != nil {
+			respondErr(w, err)
+			return
+		}
+		orphanChunks, orphanBytes, err := s.pm.OrphanStats(id)
+		if err != nil {
+			respondErr(w, err)
+			return
+		}
+		respondJSON(w, http.StatusOK, map[string]any{
+			"pool_id":       id,
+			"data_bytes":    usage.DataBytes,
+			"parity_bytes":  usage.ParityBytes,
+			"used_slots":    usage.UsedSlots,
+			"free_slots":    usage.FreeSlots,
+			"orphan_chunks": orphanChunks,
+			"orphan_bytes":  orphanBytes,
+		})
+	})
+
+	// POST /api/pools/{id}/gc —— 立刻回收这个池的孤儿分片（管理员）
+	//
+	// 返回本次扫描到/回收掉的分片数与字节数。日常不需要手动调用：后台 worker
+	// 每半小时会自己扫一轮；这个入口是给"刚清空回收站、想立刻看到空间回来"用的。
+	r.Post("/pools/{id}/gc", func(w http.ResponseWriter, r *http.Request) {
+		if !requireAdmin(w, r) {
+			return
+		}
+		id, ok := pathID(w, r, "id")
+		if !ok {
+			return
+		}
+		res, err := s.pm.GarbageCollect(id, 0)
+		if err != nil {
+			respondErr(w, err)
+			return
+		}
+		respondJSON(w, http.StatusOK, map[string]any{
+			"scanned":     res.Scanned,
+			"released":    res.Released,
+			"freed_bytes": res.FreedBytes,
+		})
+	})
+
+	// POST /api/db/compact —— 压实数据库，把已删除的行占用的空间还给文件系统（管理员）
+	//
+	// SQLite 的 VACUUM：彻底删除会删掉成片的 version_chunks 行，不压实的话
+	// 库文件不会缩。耗时且独占数据库，所以是手动操作。其他数据库返回
+	// compacted=false（不需要这一步）。
+	r.Post("/db/compact", func(w http.ResponseWriter, r *http.Request) {
+		if !requireAdmin(w, r) {
+			return
+		}
+		compacted, err := s.pm.DbManager.Compact()
+		if err != nil {
+			respondErr(w, err)
+			return
+		}
+		respondJSON(w, http.StatusOK, map[string]any{"compacted": compacted})
+	})
 }
 
 // handleRebuildPool 是 rebuild / reconstruct 的公共处理。

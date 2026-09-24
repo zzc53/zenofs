@@ -91,18 +91,23 @@ type ShareOpts struct {
 	QuotaMB     int64
 	Compression int8
 	Encryption  int8
+	// 保留策略：0 表示不限（与 Share 模型的默认值一致）
+	RecycleTtlHours int64
+	VersionKeep     int64
 }
 
 // NewShare 建一条 Share 行；UserID 非 0 时同时写入 share_users 授权。
 func (e *Env) NewShare(poolId int64, o ShareOpts) db.Share {
 	e.T.Helper()
 	s := db.Share{
-		Name:        o.Name,
-		PoolId:      poolId,
-		Quota:       o.QuotaMB,
-		Compression: o.Compression,
-		Encryption:  o.Encryption,
-		CreatedBy:   1,
+		Name:            o.Name,
+		PoolId:          poolId,
+		Quota:           o.QuotaMB,
+		Compression:     o.Compression,
+		Encryption:      o.Encryption,
+		RecycleTtlHours: o.RecycleTtlHours,
+		VersionKeep:     o.VersionKeep,
+		CreatedBy:       1,
 	}
 	if err := e.DB.DB.Create(&s).Error; err != nil {
 		e.T.Fatalf("testutil: 建 Share 失败: %v", err)

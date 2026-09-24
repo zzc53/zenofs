@@ -2,6 +2,8 @@ package vfs
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/zzc53/zenofs/internal/db"
@@ -183,5 +185,189 @@ func TestPurgeAllAndPermission(t *testing.T) {
 	}
 	if _, err := ro.PurgeAll(ctx); !errors.Is(err, ErrPermission) {
 		t.Fatalf("只读挂载 PurgeAll err = %v，期望 ErrPermission", err)
+	}
+}
+
+// chunksOfVersion 返回某个 inode 最新一个版本引用到的 chunk。
+func chunksOfVersion(t *testing.T, env *testutil.Env, inodeId int64) []db.Chunk {
+	t.Helper()
+	var v db.Version
+	if err := env.DB.DB.Where("inode_id = ?", inodeId).Order("id DESC").First(&v).Error; err != nil {
+		t.Fatalf("查版本: %v", err)
+	}
+	var ids []int64
+	if err := env.DB.DB.Model(&db.VersionChunk{}).Where("version_id = ?", v.Id).
+		Pluck("chunk_id", &ids).Error; err != nil {
+		t.Fatalf("查版本切片: %v", err)
+	}
+	var out []db.Chunk
+	if err := env.DB.DB.Where("id IN ?", ids).Find(&out).Error; err != nil {
+		t.Fatalf("查 chunk: %v", err)
+	}
+	return out
+}
+
+// chunkAbsPath 返回 chunk 落在磁盘上的绝对路径。
+func chunkAbsPath(t *testing.T, env *testutil.Env, c db.Chunk) string {
+	t.Helper()
+	var disk db.Disk
+	if err := env.DB.DB.First(&disk, c.DiskId).Error; err != nil {
+		t.Fatalf("查 chunk %d 的磁盘: %v", c.Id, err)
+	}
+	return filepath.Join(disk.Path, c.Path)
+}
+
+// TestPurgeReleasesUnreferencedChunks：彻底删除要把没人引用的分片真的从盘上删掉，
+// 并把槽位回滚成空槽交还存储池（原来只删元数据，盘上的数据一直留着）。
+func TestPurgeReleasesUnreferencedChunks(t *testing.T) {
+	env, _, fs, share := newWritable(t)
+	ctx := t.Context()
+
+	writeFile(t, fs, "/a.txt", []byte("hello"))
+	inode := lookupInode(t, env, share.Id, "a.txt")
+	chunks := chunksOfVersion(t, env, inode.Id)
+	if len(chunks) == 0 {
+		t.Fatal("写入后应当有 chunk")
+	}
+	oldPaths := make(map[int64]string, len(chunks))
+	for _, c := range chunks {
+		oldPaths[c.Id] = chunkAbsPath(t, env, c)
+		if _, err := os.Stat(oldPaths[c.Id]); err != nil {
+			t.Fatalf("写入后 chunk 文件应存在: %v", err)
+		}
+	}
+
+	if err := fs.Remove(ctx, "/a.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.Purge(ctx, inode.Id); err != nil {
+		t.Fatalf("Purge: %v", err)
+	}
+
+	for _, c := range chunks {
+		// chunk 行要留着：条带的槽位布局是分配与重建的前提
+		var got db.Chunk
+		if err := env.DB.DB.First(&got, c.Id).Error; err != nil {
+			t.Fatalf("chunk 行不该被删除: %v", err)
+		}
+		if got.Status != db.ChunkReserved {
+			t.Errorf("chunk %d status = %d, want ChunkReserved", c.Id, got.Status)
+		}
+		if got.Size != 0 || len(got.Hash) != 0 {
+			t.Errorf("chunk %d 未清空 size/hash: size=%d hash=%x", c.Id, got.Size, got.Hash)
+		}
+		if got.Path == c.Path {
+			t.Errorf("chunk %d 的 path 未更换（并发复用后会误删新数据）", c.Id)
+		}
+		if _, err := os.Stat(oldPaths[c.Id]); !os.IsNotExist(err) {
+			t.Errorf("chunk %d 的旧文件应当被删除, err=%v", c.Id, err)
+		}
+	}
+
+	var n int64
+	if err := env.DB.DB.Model(&db.Version{}).Where("inode_id = ?", inode.Id).Count(&n).Error; err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("version 记录未删除: %d", n)
+	}
+}
+
+// TestPurgeKeepsChunksStillReferenced：只要还有别的版本引用同一个分片，就不能释放它。
+func TestPurgeKeepsChunksStillReferenced(t *testing.T) {
+	env, _, fs, share := newWritable(t)
+	ctx := t.Context()
+
+	writeFile(t, fs, "/a.txt", []byte("keepme"))
+	writeFile(t, fs, "/b.txt", []byte("other"))
+	aInode := lookupInode(t, env, share.Id, "a.txt")
+	bInode := lookupInode(t, env, share.Id, "b.txt")
+
+	aChunks := chunksOfVersion(t, env, aInode.Id)
+	if len(aChunks) != 1 {
+		t.Fatalf("a.txt 有 %d 个 chunk, want 1", len(aChunks))
+	}
+	target := aChunks[0]
+	targetFile := chunkAbsPath(t, env, target)
+
+	// 手工让 b.txt 的版本也引用 a.txt 的分片：现有写路径只在同一 inode 内共享
+	// 切片（写时复制），跨文件的共享不会自然产生，所以直接造库。
+	var bVer db.Version
+	if err := env.DB.DB.Where("inode_id = ?", bInode.Id).Order("id DESC").First(&bVer).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := env.DB.DB.Create(&db.VersionChunk{
+		VersionId: bVer.Id, Idx: 99, ChunkId: target.Id, Size: target.Size, Hash: target.Hash,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if err := fs.Remove(ctx, "/a.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.Purge(ctx, aInode.Id); err != nil {
+		t.Fatalf("Purge: %v", err)
+	}
+
+	var got db.Chunk
+	if err := env.DB.DB.First(&got, target.Id).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != db.ChunkAllocated {
+		t.Errorf("仍被别的版本引用的 chunk 不该被释放，status = %d", got.Status)
+	}
+	if got.Path != target.Path || got.Size != target.Size {
+		t.Errorf("被引用的 chunk 元数据不该被改动: path=%q size=%d", got.Path, got.Size)
+	}
+	if _, err := os.Stat(targetFile); err != nil {
+		t.Errorf("被引用的 chunk 文件不该被删除: %v", err)
+	}
+}
+
+// TestPurgeShareReleasesChunks：删除整个 Share 时它的分片也要真的从盘上消失
+// （以前只删元数据，整个 Share 的数据会永久留在盘上）。
+func TestPurgeShareReleasesChunks(t *testing.T) {
+	env, pm, fs, share := newWritable(t)
+
+	writeFile(t, fs, "/a.txt", []byte("hello"))
+	inode := lookupInode(t, env, share.Id, "a.txt")
+	chunks := chunksOfVersion(t, env, inode.Id)
+	if len(chunks) == 0 {
+		t.Fatal("写入后应当有 chunk")
+	}
+	oldPaths := make(map[int64]string, len(chunks))
+	for _, c := range chunks {
+		oldPaths[c.Id] = chunkAbsPath(t, env, c)
+	}
+
+	if _, err := PurgeShare(pm, share.Id); err != nil {
+		t.Fatalf("PurgeShare: %v", err)
+	}
+
+	for _, c := range chunks {
+		var got db.Chunk
+		if err := env.DB.DB.First(&got, c.Id).Error; err != nil {
+			t.Fatal(err)
+		}
+		if got.Status != db.ChunkReserved {
+			t.Errorf("chunk %d 未回收: status = %d", c.Id, got.Status)
+		}
+		if _, err := os.Stat(oldPaths[c.Id]); !os.IsNotExist(err) {
+			t.Errorf("chunk %d 的文件应当被删除, err=%v", c.Id, err)
+		}
+	}
+
+	var n int64
+	if err := env.DB.DB.Model(&db.Inode{}).Where("share_id = ?", share.Id).Count(&n).Error; err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("inode 记录未删除: %d", n)
+	}
+	if err := env.DB.DB.Model(&db.VersionChunk{}).Count(&n).Error; err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("version_chunk 记录未删除: %d", n)
 	}
 }

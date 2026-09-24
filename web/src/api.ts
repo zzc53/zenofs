@@ -187,6 +187,9 @@ export interface ShareView {
   encryption: number
   created_by: number
   created_at: number
+  // 保留策略：0 表示不限
+  recycle_ttl_hours: number
+  version_keep: number
   encrypted: boolean
   unlocked: boolean
   permission?: string
@@ -200,6 +203,25 @@ export interface UsageView {
   free_bytes: number
   total_files: number
   free_files: number
+  // 盘上真实占用（按分片去重统计），口径与 used_bytes 不同：
+  // used_bytes 是"所有 inode 当前版本大小之和"（含回收站、不含历史版本），
+  // current/history/recycle 才是这批数据在磁盘上的实际归属。
+  current_bytes: number
+  history_bytes: number
+  recycle_bytes: number
+  reclaimable_bytes: number
+}
+
+// PoolUsageView 是存储池的真实占用（分片在盘上的实际大小）。
+export interface PoolUsageView {
+  pool_id: number
+  data_bytes: number
+  parity_bytes: number
+  used_slots: number
+  free_slots: number
+  // 谁都不引用的存量分片：可以直接回收（保护期内的不算）
+  orphan_chunks: number
+  orphan_bytes: number
 }
 
 export interface FileView {

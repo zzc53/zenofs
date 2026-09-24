@@ -30,6 +30,7 @@ import (
 	"github.com/zzc53/zenofs/internal/sftp"
 	"github.com/zzc53/zenofs/internal/smb"
 	"github.com/zzc53/zenofs/internal/token"
+	"github.com/zzc53/zenofs/internal/vfs"
 	"github.com/zzc53/zenofs/internal/webdav"
 )
 
@@ -74,6 +75,10 @@ func main() {
 	defer cancel()
 	pm.StartParityWorker(ctx)
 	pm.StartCacheCleaner(ctx)
+	// 孤儿分片回收：彻底删除 / 删除 Share 留下的存量孤儿靠它慢慢收（见 pool.GarbageCollect）
+	pm.StartOrphanGC(ctx)
+	// 保留策略：按 Share 配置清回收站、裁历史版本（见 vfs.StartRetention）
+	vfs.StartRetention(pm, ctx)
 
 	// 访问凭证：SMB / SFTP / WebDAV 都用它认证（见 internal/token）
 	tokens := token.NewManager(dbManager)

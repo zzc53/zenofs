@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -21,6 +22,44 @@ func openTemp(t *testing.T) *DbManager {
 	}
 	t.Cleanup(func() { m.Close() })
 	return m
+}
+
+// TestCompactVacuum：Compact 在 SQLite 上真的跑 VACUUM（彻底删除后把空闲页还回去）。
+func TestCompactVacuum(t *testing.T) {
+	m := openTemp(t)
+	if err := m.AutoMigrate(); err != nil {
+		t.Fatalf("AutoMigrate: %v", err)
+	}
+
+	// 先塞一批再删掉，制造出空闲页
+	big := strings.Repeat("x", 4096)
+	rows := make([]Setting, 0, 200)
+	for i := 0; i < 200; i++ {
+		rows = append(rows, Setting{Name: fmt.Sprintf("k%03d", i), Value: big})
+	}
+	if err := m.DB.Create(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := m.DB.Where("name LIKE 'k%'").Delete(&Setting{}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	compacted, err := m.Compact()
+	if err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	if !compacted {
+		t.Fatal("SQLite 上 Compact 应当执行 VACUUM")
+	}
+
+	// 默认配置还在，VACUUM 不该动数据
+	var n int64
+	if err := m.DB.Model(&Setting{}).Where("name = ?", "HTTP_PORT").Count(&n).Error; err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("VACUUM 之后默认配置丢了: %d 条", n)
+	}
 }
 
 func TestNewSQLiteAndAutoMigrate(t *testing.T) {

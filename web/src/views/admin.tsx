@@ -5,6 +5,7 @@ import {
   type CreatedUserView,
   type DiskView,
   type GrantView,
+  type PoolUsageView,
   type PoolView,
   type ShareView,
   type TaskView,
@@ -48,7 +49,12 @@ function SharesAdmin() {
     quota_mb: '0',
     compression: '0',
     password: '',
+    recycle_ttl_hours: '0',
+    version_keep: '0',
   })
+  // 修改已有 Share 的保留策略（创建时的表单只管新建）
+  const [retentionFor, setRetentionFor] = useState<ShareView | null>(null)
+  const [retentionForm, setRetentionForm] = useState({ recycle_ttl_hours: '0', version_keep: '0' })
 
   async function load() {
     setError('')
@@ -87,6 +93,8 @@ function SharesAdmin() {
         pool_id: Number(form.pool_id),
         quota_mb: Number(form.quota_mb) || 0,
         compression: Number(form.compression) || 0,
+        recycle_ttl_hours: Number(form.recycle_ttl_hours) || 0,
+        version_keep: Number(form.version_keep) || 0,
         ...(form.password ? { password: form.password } : {}),
       })
       setCreating(false)
@@ -98,8 +106,34 @@ function SharesAdmin() {
     }
   }
 
-  async function remove(share: ShareView, force = false) {
+  // openRetention / saveRetention 改已有 Share 的保留策略：回收站 TTL 与版本上限
+  // 都是 Share 上的配置，后台 worker 每轮按各自的阈值执行。
+  function openRetention(s: ShareView) {
+    setRetentionFor(s)
+    setRetentionForm({
+      recycle_ttl_hours: String(s.recycle_ttl_hours ?? 0),
+      version_keep: String(s.version_keep ?? 0),
+    })
+  }
+
+  async function saveRetention() {
+    if (!retentionFor) return
     setError('')
+    try {
+      await api.put(`/api/shares/${retentionFor.id}`, {
+        recycle_ttl_hours: Number(retentionForm.recycle_ttl_hours) || 0,
+        version_keep: Number(retentionForm.version_keep) || 0,
+      })
+      setRetentionFor(null)
+      await load()
+      await refreshShares()
+      notify(t('policySaved'))
+    } catch (err) {
+      setError(msg(err))
+    }
+  }
+
+  async function remove(share: ShareView, force = false) {    setError('')
     try {
       await api.del(`/api/shares/${share.id}${force ? '?force=1' : ''}`)
       await load()
@@ -184,6 +218,9 @@ function SharesAdmin() {
                       {s.unlocked ? t('lockShare') : t('unlockShare')}
                     </button>
                   )}
+                  <button class="btn-secondary" onClick={() => openRetention(s)}>
+                    {t('retentionTitle')}
+                  </button>
                   <button class="btn-secondary" onClick={() => setGrantFor(s)}>
                     {t('grantedUsers')}
                   </button>
@@ -227,6 +264,20 @@ function SharesAdmin() {
               onInput={(e) => setForm({ ...form, quota_mb: e.currentTarget.value })}
             />
           </Field>
+          <Field label={t('recycleTtlHours')}>
+            <input
+              value={form.recycle_ttl_hours}
+              inputMode="numeric"
+              onInput={(e) => setForm({ ...form, recycle_ttl_hours: e.currentTarget.value })}
+            />
+          </Field>
+          <Field label={t('versionKeep')}>
+            <input
+              value={form.version_keep}
+              inputMode="numeric"
+              onInput={(e) => setForm({ ...form, version_keep: e.currentTarget.value })}
+            />
+          </Field>
           <Field label={t('compression')}>
             <select
               value={form.compression}
@@ -255,6 +306,29 @@ function SharesAdmin() {
             void refreshShares()
           }}
         />
+      )}
+
+      {retentionFor && (
+        <Modal
+          title={`${t('retentionTitle')} · ${retentionFor.name}`}
+          onClose={() => setRetentionFor(null)}
+          footer={<button onClick={() => void saveRetention()}>{t('save')}</button>}
+        >
+          <Field label={t('recycleTtlHours')}>
+            <input
+              value={retentionForm.recycle_ttl_hours}
+              inputMode="numeric"
+              onInput={(e) => setRetentionForm({ ...retentionForm, recycle_ttl_hours: e.currentTarget.value })}
+            />
+          </Field>
+          <Field label={t('versionKeep')}>
+            <input
+              value={retentionForm.version_keep}
+              inputMode="numeric"
+              onInput={(e) => setRetentionForm({ ...retentionForm, version_keep: e.currentTarget.value })}
+            />
+          </Field>
+        </Modal>
       )}
     </div>
   )
@@ -610,6 +684,7 @@ function UsersAdmin() {
 function PoolsAdmin() {
   const [pools, setPools] = useState<PoolView[]>([])
   const [disks, setDisks] = useState<Record<number, DiskView[]>>({})
+  const [poolUsage, setPoolUsage] = useState<Record<number, PoolUsageView>>({})
   const [tasks, setTasks] = useState<TaskView[]>([])
   const [error, setError] = useState('')
   const [creating, setCreating] = useState(false)
@@ -633,12 +708,15 @@ function PoolsAdmin() {
       setPools(poolList)
       setTasks(taskList ?? [])
       const byPool: Record<number, DiskView[]> = {}
+      const usageByPool: Record<number, PoolUsageView> = {}
       await Promise.all(
         poolList.map(async (p) => {
           byPool[p.Id] = await api.get<DiskView[]>(`/api/pools/${p.Id}/disks`)
+          usageByPool[p.Id] = await api.get<PoolUsageView>(`/api/pools/${p.Id}/usage`)
         }),
       )
       setDisks(byPool)
+      setPoolUsage(usageByPool)
     } catch (err) {
       setError(msg(err))
     }
@@ -721,6 +799,19 @@ function PoolsAdmin() {
     }
   }
 
+  // collectOrphans 立刻回收该池的孤儿分片（后台每半小时也会自己扫一轮，
+  // 这个按钮是给"刚清空回收站、想马上看到空间回来"用的）。
+  async function collectOrphans(pool: PoolView) {
+    setError('')
+    try {
+      const res = await api.post<{ released: number; freed_bytes: number }>(`/api/pools/${pool.Id}/gc`)
+      notify(t('reclaimedOrphans', { size: fmtBytes(res.freed_bytes), n: res.released }))
+      await load()
+    } catch (err) {
+      setError(msg(err))
+    }
+  }
+
   const statusName = (s: number) =>
     s === 0 ? t('online') : s === 1 ? t('offline') : t('repair')
 
@@ -750,6 +841,28 @@ function PoolsAdmin() {
                 {t('dataShards')} {p.DataShards} · {t('parityShards')} {p.ParityShards} ·{' '}
                 {p.ChunkSize} KB · {statusName(p.Status)}
               </span>
+              {poolUsage[p.Id] && (
+                <span class="muted small">
+                  {t('poolUsage', {
+                    data: fmtBytes(poolUsage[p.Id].data_bytes),
+                    parity: fmtBytes(poolUsage[p.Id].parity_bytes),
+                    free: poolUsage[p.Id].free_slots,
+                  })}
+                </span>
+              )}
+              {poolUsage[p.Id] && poolUsage[p.Id].orphan_bytes > 0 && (
+                <>
+                  <span class="muted small">
+                    {t('orphanUsage', {
+                      size: fmtBytes(poolUsage[p.Id].orphan_bytes),
+                      n: poolUsage[p.Id].orphan_chunks,
+                    })}
+                  </span>
+                  <button class="btn-secondary" onClick={() => void collectOrphans(p)}>
+                    {t('gcNow')}
+                  </button>
+                </>
+              )}
               <span class="spacer" />
               <button class="btn-secondary" onClick={() => setAddingDisk(p)}>
                 {t('addDisk')}

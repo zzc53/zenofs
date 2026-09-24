@@ -16,7 +16,8 @@ type deletedView struct {
 // registerRecycleRoutes 注册回收站端点。
 //
 // 删除（DELETE /shares/{id}/files）只做软删除，条目留在这里；恢复就是把标记抹掉，
-// 彻底删除才移除元数据记录（存储层的 chunk 由后续 GC 处理，见 vfs.Purge 的注释）。
+// 彻底删除会移除元数据，并把**没人再引用的分片**从盘上回收（见 vfs.Purge 与
+// pool.ReleaseChunks）；"清空回收站"走同一条路径。
 func (s *server) registerRecycleRoutes(r chi.Router) {
 	// GET /api/shares/{id}/recycle —— 回收站列表（最近删除的在前）
 	r.Get("/shares/{id}/recycle", func(w http.ResponseWriter, r *http.Request) {

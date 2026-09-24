@@ -80,18 +80,22 @@ const (
 )
 
 // Chunk 是条带中的一个分片，存储在 Disk 上。
+//
+// 索引 idx_chunk_gc (pool_id, status, type, created_at) 是给孤儿回收用的：
+// GC 的判据是"pool 内 type=data、status=Allocated、且创建时间早于保护期"，
+// 这条索引让扫描不必全表扫（chunks 往往是库里行数最多的一张表）。
 type Chunk struct {
 	Id        int64       `gorm:"primaryKey"`
-	Status    ChunkStatus `gorm:"index"`
+	Status    ChunkStatus `gorm:"index;index:idx_chunk_gc,priority:2"`
 	Path      string      // 相对路径（在 Disk.Path 下的位置）
 	Size      int64       // 数据实际大小（字节）
 	Hash      []byte      // BLAKE3 哈希，用于数据完整性校验
-	DiskId    int64       `gorm:"index"` // 所在磁盘
-	StripeId  int64       `gorm:"index"` // 所属条带
-	PoolId    int64       `gorm:"index"` // 所属存储池
-	Type      ChunkType
-	Index     int64 // 在条带中的序号（data=0..D-1, parity=0..P-1）
-	CreatedAt int64 `gorm:"autoCreateTime"`
+	DiskId    int64       `gorm:"index"`                               // 所在磁盘
+	StripeId  int64       `gorm:"index"`                               // 所属条带
+	PoolId    int64       `gorm:"index;index:idx_chunk_gc,priority:1"` // 所属存储池
+	Type      ChunkType   `gorm:"index:idx_chunk_gc,priority:3"`       // data / parity
+	Index     int64       // 在条带中的序号（data=0..D-1, parity=0..P-1）
+	CreatedAt int64       `gorm:"autoCreateTime;index:idx_chunk_gc,priority:4"`
 }
 
 // WriteQueue 是 write 计算的任务队列。
@@ -242,6 +246,14 @@ type Share struct {
 	EncryptionKeyHash []byte `gorm:"default:null"`   // 加密密钥校验值 / PBKDF2 salt（启用加密时非空）
 	CreatedBy         int64  `gorm:"index"`          // 创建者用户 ID
 	CreatedAt         int64  `gorm:"autoCreateTime"`
+
+	// RecycleTtlHours 是回收站保留时长（小时）。0（默认）表示不自动清除——
+	// 回收站里的条目一直留着，直到有人恢复或手动彻底删除。软删除时间取
+	// inode.updated_at（恢复会刷新它，所以"恢复后再删"重新计时）。
+	RecycleTtlHours int64 `gorm:"default:0"`
+	// VersionKeep 是每个文件保留的版本数上限（含当前版本）。0（默认）表示不限，
+	// 即版本只增不减。裁剪由后台任务执行（见 vfs.SweepVersions），写入路径不动。
+	VersionKeep int64 `gorm:"default:0"`
 }
 
 // ShareUser 记录用户对 Share 的访问权限。

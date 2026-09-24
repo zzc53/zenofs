@@ -246,6 +246,18 @@ export function FilesView({ shareId, dirPath }: { shareId?: number; dirPath: str
           <span class="muted small">
             {t('usedOfTotal', { used: fmtBytes(usage.used_bytes), total: fmtBytes(usage.total_bytes) })}
           </span>
+          <span class="muted small">
+            {t('usageBreakdown', {
+              current: fmtBytes(usage.current_bytes),
+              history: fmtBytes(usage.history_bytes),
+              recycle: fmtBytes(usage.recycle_bytes),
+            })}
+          </span>
+          {usage.reclaimable_bytes > 0 && (
+            <span class="muted small">
+              {t('reclaimable', { size: fmtBytes(usage.reclaimable_bytes) })}
+            </span>
+          )}
         </div>
       )}
 

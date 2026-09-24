@@ -40,6 +40,9 @@ type DbManager struct {
 	// 还会把后面的请求一起拖住——连接被占着不放，新请求排队，表现出来就是"卡死"。
 	// 有超时至少能保证请求 fail fast、服务不倒，并在日志里留下证据。
 	TxTimeout time.Duration
+
+	// sqlite 记录底层驱动是不是 SQLite。Compact 只对它有意义（见该方法）。
+	sqlite bool
 }
 
 // New 根据 URL 前缀自动选择 SQLite/MySQL/PostgreSQL 驱动建立连接。
@@ -70,8 +73,15 @@ func New(url string) (*DbManager, error) {
 		if strings.Contains(path, "?") {
 			sep = "&" // 调用方自己带了参数
 		}
+		// secure_delete(1)：删除行时把内容覆写掉，而不是只标记页面为空闲。
+		//
+		// 为什么开：彻底删除文件（Purge / 删除 Share）会删掉大量 version_chunks
+		// 行，不开这个的话，这些行在被 VACUUM 或页面复用覆盖之前一直留在库里
+		// ——"删干净"就打了折扣。代价是每次 DELETE 多一次覆写，写入略慢一点，
+		// 对 NAS 这种删除远少于写入的负载可以接受。
 		dial = sqlite.Open(path + sep +
-			"_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_txlock=immediate")
+			"_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)" +
+			"&_pragma=secure_delete(1)&_txlock=immediate")
 	} else if strings.HasPrefix(url, "mysql://") {
 		dial = mysql.Open(url)
 	} else if strings.HasPrefix(url, "postgres://") {
@@ -93,7 +103,7 @@ func New(url string) (*DbManager, error) {
 		return nil, errs.FromError(err, errs.ECODE_DB_BAD_CONN, errs.ESTR_DB_BAD_CONN)
 	}
 
-	m := &DbManager{DB: gdb, TxTimeout: defaultTxTimeout}
+	m := &DbManager{DB: gdb, TxTimeout: defaultTxTimeout, sqlite: isSQLite}
 
 	if isSQLite {
 		sqlDB, err := gdb.DB()
@@ -158,6 +168,26 @@ func (m *DbManager) Close() error {
 		return err
 	}
 	return sqlDB.Close()
+}
+
+// Compact 让数据库把已删除数据占用的空间还给操作系统，返回是否真的做了压实。
+//
+// 为什么需要它：SQLite 删掉行之后文件不会自己变小，空闲页只会在后续写入时被
+// 复用。彻底删除一个大目录可能删掉几十万行 version_chunks，库文件却一点不缩
+// ——"腾空间"在这一环上是断的。所以给管理员留一个手动入口：VACUUM 会独占数据库
+// 且耗时（大库可能几十秒），不适合做成自动任务。
+//
+// MySQL / PostgreSQL 不需要这一步（表空间由引擎管理，行删掉就直接还给表空间），
+// 那里返回 false 且不报错——这是"不需要做"，不是失败。
+func (m *DbManager) Compact() (bool, error) {
+	if !m.sqlite {
+		return false, nil
+	}
+	// VACUUM 不能在事务里跑，所以走 DB.Exec 而不是 Tx。
+	if err := m.DB.Exec("VACUUM").Error; err != nil {
+		return true, errs.DBQuery(err)
+	}
+	return true, nil
 }
 
 // AutoMigrate 自动迁移给定的模型。

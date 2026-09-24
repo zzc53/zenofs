@@ -14,6 +14,8 @@ const base = {
   created_by: 1,
   created_at: 0,
   permission: 'admin',
+  recycle_ttl_hours: 0,
+  version_keep: 0,
 }
 
 test('plain share is never locked', () => {

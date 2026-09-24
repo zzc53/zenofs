@@ -46,6 +46,8 @@ export function SetupView() {
   // 第 4 步：共享
   const [shareName, setShareName] = useState('files')
   const [quota, setQuota] = useState('0')
+  const [recycleTtl, setRecycleTtl] = useState('0')
+  const [versionKeep, setVersionKeep] = useState('0')
   const [sharePassword, setSharePassword] = useState('')
 
   const dataDisks = disks.filter((d) => d.Type === 0).length
@@ -116,6 +118,8 @@ export function SetupView() {
         name: shareName,
         pool_id: pool.Id,
         quota_mb: Number(quota) || 0,
+        recycle_ttl_hours: Number(recycleTtl) || 0,
+        version_keep: Number(versionKeep) || 0,
         ...(sharePassword ? { password: sharePassword } : {}),
       })
       await refreshShares()
@@ -294,6 +298,20 @@ export function SetupView() {
             </Field>
             <Field label={t('quotaMb')}>
               <input value={quota} inputMode="numeric" onInput={(e) => setQuota(e.currentTarget.value)} />
+            </Field>
+            <Field label={t('recycleTtlHours')}>
+              <input
+                value={recycleTtl}
+                inputMode="numeric"
+                onInput={(e) => setRecycleTtl(e.currentTarget.value)}
+              />
+            </Field>
+            <Field label={t('versionKeep')}>
+              <input
+                value={versionKeep}
+                inputMode="numeric"
+                onInput={(e) => setVersionKeep(e.currentTarget.value)}
+              />
             </Field>
             <Field label={t('encryptionPassword')} hint={t('hintMinPassword')}>
               <input
